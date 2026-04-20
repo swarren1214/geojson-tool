@@ -37,6 +37,14 @@ const EMPTY_COLLECTION: AnyFeatureCollection = {
 };
 
 const BASEMAP_STYLE = 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json';
+const POLYGON_FILL_COLOR = '#2a9d8f';
+const POLYGON_SPLIT_FILL_COLOR = '#e85d04';
+const POLYGON_SELECTED_FILL_COLOR = '#f59e0b';
+const POLYGON_HOVER_FILL_COLOR = '#0f172a';
+
+function getPolygonBaseColor(splitByState: boolean): string {
+  return splitByState ? POLYGON_SPLIT_FILL_COLOR : POLYGON_FILL_COLOR;
+}
 
 type UploadedFileMeta = {
   id: string;
@@ -618,12 +626,12 @@ export default function App() {
           'fill-color': [
             'case',
             ['boolean', ['feature-state', 'selected'], false],
-            '#f59e0b',
+            POLYGON_SELECTED_FILL_COLOR,
             ['boolean', ['feature-state', 'hover'], false],
-            '#0f172a',
+            POLYGON_HOVER_FILL_COLOR,
             ['boolean', ['get', 'splitByState'], false],
-            '#e85d04',
-            '#2a9d8f',
+            POLYGON_SPLIT_FILL_COLOR,
+            POLYGON_FILL_COLOR,
           ],
           'fill-opacity': [
             'case',
@@ -1073,15 +1081,19 @@ export default function App() {
     setError('');
   }
 
-  function handleSplitAll() {
+  async function handleSplitAll() {
     if (!displayData.features.length) {
       return;
     }
 
-    const result = splitPolygonsByStates(displayData);
-    recordHistorySnapshot();
-    setDisplayData(withFeatureIds(result.data, 'split-all'));
-    setError('');
+    try {
+      const result = await splitPolygonsByStates(displayData);
+      recordHistorySnapshot();
+      setDisplayData(withFeatureIds(result.data, 'split-all'));
+      setError('');
+    } catch {
+      setError('Split failed. Could not split polygons by state.');
+    }
   }
 
   function handleSmoothAll() {
@@ -1130,7 +1142,7 @@ export default function App() {
     closeSmoothPanel();
   }
 
-  function handleSplitFeatureById(appFeatureId: string) {
+  async function handleSplitFeatureById(appFeatureId: string) {
     const targetFeature = displayData.features.find(
       (feature) => feature.properties?.appFeatureId === appFeatureId,
     ) as Feature<Geometry, GeoJsonProperties> | undefined;
@@ -1139,10 +1151,16 @@ export default function App() {
       return;
     }
 
-    const splitResult = splitPolygonsByStates({
-      type: 'FeatureCollection',
-      features: [targetFeature],
-    });
+    let splitResult: Awaited<ReturnType<typeof splitPolygonsByStates>>;
+    try {
+      splitResult = await splitPolygonsByStates({
+        type: 'FeatureCollection',
+        features: [targetFeature],
+      });
+    } catch {
+      setError('Split failed. Could not split the selected polygon by state.');
+      return;
+    }
 
     const splitFeatures = splitResult.data.features.map((feature, index) => ({
       ...feature,
@@ -1547,6 +1565,9 @@ export default function App() {
                       group.polygons.map((item, index) => {
                         const isChecked = selectedForMerge.has(item.appFeatureId);
                         const isSelected = !mergeMode && selectedFeatureId === item.appFeatureId;
+                        const polygonColor = isSelected
+                          ? POLYGON_SELECTED_FILL_COLOR
+                          : getPolygonBaseColor(item.splitByState);
                         return (
                         <div
                           key={item.appFeatureId}
@@ -1577,6 +1598,11 @@ export default function App() {
                               </div>
                             ) : (
                               <div className="flex items-center gap-1">
+                                <span
+                                  aria-hidden="true"
+                                  className="h-2.5 w-2.5 rounded-full ring-1 ring-slate-300"
+                                  style={{ backgroundColor: polygonColor }}
+                                />
                                 <p className="truncate text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                                   Polygon {index + 1}
                                 </p>
