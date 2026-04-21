@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map } from 'maplibre-gl';
+import { AnimatePresence, motion } from 'framer-motion';
 import type { Feature, GeoJsonProperties, Geometry, MultiPolygon, Polygon } from 'geojson';
 import {
   Braces,
   Check,
+  ChevronDown,
+  ChevronUp,
   Download,
   FileUp,
   FolderTree,
@@ -436,6 +439,7 @@ export default function App() {
   const [isSplittingAll, setIsSplittingAll] = useState<boolean>(false);
   const [splittingFeatureIds, setSplittingFeatureIds] = useState<Set<string>>(new Set());
   const [operationAlert, setOperationAlert] = useState<OperationAlertState | null>(null);
+  const [collapsedPolygonIds, setCollapsedPolygonIds] = useState<Set<string>>(new Set());
   const [polygonNames, setPolygonNames] = useState<Record<string, string>>({});
   const [editingPolygonId, setEditingPolygonId] = useState<string | null>(null);
   const [editingPolygonNameDraft, setEditingPolygonNameDraft] = useState<string>('');
@@ -646,6 +650,19 @@ export default function App() {
     return lookup;
   }, [polygonItems, polygonNames]);
 
+  const polygonMetricsById = useMemo<Record<string, GeometryMetrics>>(() => {
+    const lookup: Record<string, GeometryMetrics> = {};
+    displayData.features.forEach((feature) => {
+      const appFeatureId = feature.properties?.appFeatureId;
+      if (typeof appFeatureId !== 'string' || !appFeatureId.trim()) {
+        return;
+      }
+
+      lookup[appFeatureId] = countFeatureGeometryMetrics(feature as Feature<Geometry, GeoJsonProperties>);
+    });
+    return lookup;
+  }, [displayData]);
+
   const smoothPreviewData = useMemo<AnyFeatureCollection>(() => {
     if (!smoothPanel.open || !smoothPanel.appFeatureId) {
       return displayData;
@@ -762,6 +779,33 @@ export default function App() {
       setEditingPolygonNameDraft('');
     }
   }, [editingPolygonId, polygonItems]);
+
+  useEffect(() => {
+    setCollapsedPolygonIds((previous) => {
+      const validIds = new Set(polygonItems.map((item) => item.appFeatureId));
+      const next = new Set<string>();
+
+      previous.forEach((id) => {
+        if (validIds.has(id)) {
+          next.add(id);
+        }
+      });
+
+      return next;
+    });
+  }, [polygonItems]);
+
+  function togglePolygonExpanded(appFeatureId: string) {
+    setCollapsedPolygonIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(appFeatureId)) {
+        next.delete(appFeatureId);
+      } else {
+        next.add(appFeatureId);
+      }
+      return next;
+    });
+  }
 
   function clearHoveredFeature(map: Map) {
     if (!hoveredFeatureIdRef.current) {
@@ -1625,6 +1669,15 @@ export default function App() {
   }
 
   function startPolygonNameEdit(appFeatureId: string) {
+    setCollapsedPolygonIds((previous) => {
+      if (!previous.has(appFeatureId)) {
+        return previous;
+      }
+
+      const next = new Set(previous);
+      next.delete(appFeatureId);
+      return next;
+    });
     setEditingPolygonId(appFeatureId);
     setEditingPolygonNameDraft(polygonNameById[appFeatureId] || '');
   }
@@ -1912,6 +1965,8 @@ export default function App() {
                         const isChecked = selectedForMerge.has(item.appFeatureId);
                         const isSelected = !mergeMode && selectedFeatureId === item.appFeatureId;
                         const isSplitBusy = splittingFeatureIds.has(item.appFeatureId);
+                        const isCollapsed = collapsedPolygonIds.has(item.appFeatureId);
+                        const metrics = polygonMetricsById[item.appFeatureId] || { vertices: 0, edges: 0 };
                         const polygonColor = isSelected
                           ? POLYGON_SELECTED_FILL_COLOR
                           : polygonColorById[item.appFeatureId] || getPolygonColorForId(item.appFeatureId);
@@ -1928,7 +1983,7 @@ export default function App() {
                               : 'border-slate-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/40'
                           } ${mergeMode ? 'cursor-pointer' : ''}`}
                         >
-                          <div className="mb-2 flex items-center justify-between gap-2">
+                          <div className="flex items-center justify-between gap-2">
                             {mergeMode ? (
                               <div className="flex items-center gap-2">
                                 <input
@@ -2019,49 +2074,81 @@ export default function App() {
                                 >
                                   <Trash2 className="h-3 w-3" />
                                 </PolygonIconActionButton>
+                                <PolygonIconActionButton
+                                  onClick={() => togglePolygonExpanded(item.appFeatureId)}
+                                  tooltip={isCollapsed ? 'Expand Details' : 'Collapse Details'}
+                                  ariaLabel={isCollapsed ? 'Expand polygon details' : 'Collapse polygon details'}
+                                  className="inline-flex p-1 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-slate-700 transition hover:bg-slate-100"
+                                >
+                                  {isCollapsed ? <ChevronDown className="h-3 w-3" /> : <ChevronUp className="h-3 w-3" />}
+                                </PolygonIconActionButton>
                               </div>
                             )}
                           </div>
 
-                          <div className="mt-1 flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
-                            {editingPolygonId === item.appFeatureId ? (
-                              <>
-                                <input
-                                  value={editingPolygonNameDraft}
-                                  onChange={(event) => setEditingPolygonNameDraft(event.target.value)}
-                                  onClick={(event) => event.stopPropagation()}
-                                  className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-900"
-                                  placeholder="Polygon name"
-                                />
-                                <button
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    savePolygonNameEdit(item.appFeatureId);
-                                  }}
-                                  title="Save name"
-                                  aria-label="Save name"
-                                  className="inline-flex p-2 items-center justify-center rounded-md bg-emerald-600 text-white transition hover:bg-emerald-500"
-                                >
-                                  <Check className="h-4.5 w-4.5" />
-                                </button>
-                                <button
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    cancelPolygonNameEdit();
-                                  }}
-                                  title="Cancel rename"
-                                  aria-label="Cancel rename"
-                                  className="inline-flex p-2 items-center justify-center rounded-md border border-slate-300 text-slate-700 transition hover:bg-slate-50"
-                                >
-                                  <X className="h-4.5 w-4.5" />
-                                </button>
-                              </>
-                            ) : (
-                              <p className="w-full truncate rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-sm text-slate-700">
-                                {polygonNameById[item.appFeatureId] || item.defaultName}
-                              </p>
-                            )}
-                          </div>
+                          <AnimatePresence initial={false}>
+                            {!isCollapsed ? (
+                              <motion.div
+                                key={`details-${item.appFeatureId}`}
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: 'auto', opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                transition={{ duration: 0.2, ease: 'easeInOut' }}
+                                className="overflow-hidden"
+                              >
+                              <div className="mt-1 flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
+                                {editingPolygonId === item.appFeatureId ? (
+                                  <>
+                                    <input
+                                      value={editingPolygonNameDraft}
+                                      onChange={(event) => setEditingPolygonNameDraft(event.target.value)}
+                                      onClick={(event) => event.stopPropagation()}
+                                      className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-900"
+                                      placeholder="Polygon name"
+                                    />
+                                    <button
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        savePolygonNameEdit(item.appFeatureId);
+                                      }}
+                                      title="Save name"
+                                      aria-label="Save name"
+                                      className="inline-flex p-2 items-center justify-center rounded-md bg-emerald-600 text-white transition hover:bg-emerald-500"
+                                    >
+                                      <Check className="h-4.5 w-4.5" />
+                                    </button>
+                                    <button
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        cancelPolygonNameEdit();
+                                      }}
+                                      title="Cancel rename"
+                                      aria-label="Cancel rename"
+                                      className="inline-flex p-2 items-center justify-center rounded-md border border-slate-300 text-slate-700 transition hover:bg-slate-50"
+                                    >
+                                      <X className="h-4.5 w-4.5" />
+                                    </button>
+                                  </>
+                                ) : (
+                                  <p className="w-full mt-2 truncate rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-sm text-slate-700">
+                                    {polygonNameById[item.appFeatureId] || item.defaultName}
+                                  </p>
+                                )}
+                              </div>
+
+                              <div className="mt-2 grid grid-cols-2 gap-2" onClick={(event) => event.stopPropagation()}>
+                                <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                                  <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Vertices</p>
+                                  <p className="mt-0.5 text-sm font-bold text-slate-800">{metrics.vertices}</p>
+                                </div>
+                                <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                                  <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Edges</p>
+                                  <p className="mt-0.5 text-sm font-bold text-slate-800">{metrics.edges}</p>
+                                </div>
+                              </div>
+                              </motion.div>
+                            ) : null}
+                          </AnimatePresence>
                         </div>
                         );
                       })
