@@ -25,7 +25,9 @@ export async function getStateBoundaries(): Promise<FeatureCollection<Polygon | 
     return cachedStatePromise;
   }
 
-  cachedStatePromise = fetch('/tiger2025-states.json')
+  const statesUrl = `${import.meta.env.BASE_URL}tiger2025-states.json`;
+
+  cachedStatePromise = fetch(statesUrl)
     .then(async (response) => {
       if (!response.ok) {
         throw new Error(`Failed to load state boundaries (${response.status})`);
