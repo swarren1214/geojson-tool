@@ -7,6 +7,7 @@ import {
   Download,
   FileUp,
   FolderTree,
+  Loader2,
   MapPinned,
   Merge,
   Pencil,
@@ -29,7 +30,7 @@ import {
   type SmoothAlgorithm,
   splitPolygonsByStates,
 } from './lib/geojson';
-import { getStateBoundaries } from './lib/stateBoundaries';
+import { getEmptyStateBoundaries, getStateBoundaries } from './lib/stateBoundaries';
 
 const EMPTY_COLLECTION: AnyFeatureCollection = {
   type: 'FeatureCollection',
@@ -38,12 +39,84 @@ const EMPTY_COLLECTION: AnyFeatureCollection = {
 
 const BASEMAP_STYLE = 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json';
 const POLYGON_FILL_COLOR = '#2a9d8f';
-const POLYGON_SPLIT_FILL_COLOR = '#e85d04';
 const POLYGON_SELECTED_FILL_COLOR = '#f59e0b';
 const POLYGON_HOVER_FILL_COLOR = '#0f172a';
 
-function getPolygonBaseColor(splitByState: boolean): string {
-  return splitByState ? POLYGON_SPLIT_FILL_COLOR : POLYGON_FILL_COLOR;
+function getPolygonColorForId(appFeatureId: string): string {
+  // Hash the feature id into a stable hue so each polygon keeps its own color.
+  let hash = 0;
+  for (let i = 0; i < appFeatureId.length; i++) {
+    hash = (hash << 5) - hash + appFeatureId.charCodeAt(i);
+    hash |= 0;
+  }
+
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue} 62% 58%)`;
+}
+
+function buildPolygonColorById(data: AnyFeatureCollection): Record<string, string> {
+  const colorById: Record<string, string> = {};
+  const usedHueBuckets = new Set<number>();
+
+  data.features.forEach((feature, index) => {
+    if (!isPolygonFeature(feature as Feature<Geometry, GeoJsonProperties>)) {
+      return;
+    }
+
+    const appFeatureId = feature.properties?.appFeatureId;
+    if (typeof appFeatureId !== 'string' || !appFeatureId.trim()) {
+      return;
+    }
+
+    let hue = Math.abs(
+      appFeatureId.split('').reduce((acc, char) => ((acc << 5) - acc + char.charCodeAt(0)) | 0, index),
+    ) % 360;
+    let bucket = Math.floor(hue / 8);
+
+    // Spread neighboring IDs apart so split siblings do not collapse into the same visible color.
+    while (usedHueBuckets.has(bucket)) {
+      hue = (hue + 137) % 360;
+      bucket = Math.floor(hue / 8);
+    }
+
+    usedHueBuckets.add(bucket);
+    colorById[appFeatureId] = `hsl(${hue} 62% 58%)`;
+  });
+
+  return colorById;
+}
+
+function withPolygonColors(
+  data: AnyFeatureCollection,
+  colorById: Record<string, string>,
+): AnyFeatureCollection {
+  return {
+    ...data,
+    features: data.features.map((feature) => {
+      if (!isPolygonFeature(feature as Feature<Geometry, GeoJsonProperties>)) {
+        return feature;
+      }
+
+      const appFeatureId = feature.properties?.appFeatureId;
+      if (typeof appFeatureId !== 'string' || !appFeatureId.trim()) {
+        return feature;
+      }
+
+      return {
+        ...feature,
+        properties: {
+          ...feature.properties,
+          polygonColor: colorById[appFeatureId] || getPolygonColorForId(appFeatureId),
+        },
+      };
+    }),
+  };
+}
+
+function waitForUiPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
 type UploadedFileMeta = {
@@ -68,6 +141,7 @@ type PolygonListItem = {
   defaultName: string;
   isMultiPolygon: boolean;
   stateName?: string;
+  stateBadge?: string;
   splitByState: boolean;
 };
 
@@ -100,7 +174,13 @@ type PolygonIconActionButtonProps = {
   ariaLabel: string;
   tooltip: string;
   className: string;
+  disabled?: boolean;
   children: ReactNode;
+};
+
+type OperationAlertState = {
+  type: 'success' | 'error';
+  message: string;
 };
 
 const MAX_HISTORY_ENTRIES = 100;
@@ -116,6 +196,73 @@ function sanitizeFileName(value: string): string {
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
     .toLowerCase();
+}
+
+const STATE_NAME_TO_CODE: Record<string, string> = {
+  Alabama: 'AL',
+  Alaska: 'AK',
+  Arizona: 'AZ',
+  Arkansas: 'AR',
+  California: 'CA',
+  Colorado: 'CO',
+  Connecticut: 'CT',
+  Delaware: 'DE',
+  'District of Columbia': 'DC',
+  Florida: 'FL',
+  Georgia: 'GA',
+  Hawaii: 'HI',
+  Idaho: 'ID',
+  Illinois: 'IL',
+  Indiana: 'IN',
+  Iowa: 'IA',
+  Kansas: 'KS',
+  Kentucky: 'KY',
+  Louisiana: 'LA',
+  Maine: 'ME',
+  Maryland: 'MD',
+  Massachusetts: 'MA',
+  Michigan: 'MI',
+  Minnesota: 'MN',
+  Mississippi: 'MS',
+  Missouri: 'MO',
+  Montana: 'MT',
+  Nebraska: 'NE',
+  Nevada: 'NV',
+  'New Hampshire': 'NH',
+  'New Jersey': 'NJ',
+  'New Mexico': 'NM',
+  'New York': 'NY',
+  'North Carolina': 'NC',
+  'North Dakota': 'ND',
+  Ohio: 'OH',
+  Oklahoma: 'OK',
+  Oregon: 'OR',
+  Pennsylvania: 'PA',
+  'Rhode Island': 'RI',
+  'South Carolina': 'SC',
+  'South Dakota': 'SD',
+  Tennessee: 'TN',
+  Texas: 'TX',
+  Utah: 'UT',
+  Vermont: 'VT',
+  Virginia: 'VA',
+  Washington: 'WA',
+  'West Virginia': 'WV',
+  Wisconsin: 'WI',
+  Wyoming: 'WY',
+};
+
+function getStateCodeLabel(stateName: string | undefined): string | undefined {
+  if (typeof stateName !== 'string') {
+    return undefined;
+  }
+
+  const normalizedName = stateName.trim();
+  if (!normalizedName) {
+    return undefined;
+  }
+
+  return STATE_NAME_TO_CODE[normalizedName] || normalizedName;
 }
 
 function getPolygonDefaultName(feature: Feature<Geometry, GeoJsonProperties>, index: number): string {
@@ -149,12 +296,22 @@ function annotateImportedCollection(data: AnyFeatureCollection, fileId: string, 
 }
 
 function withFeatureIds(data: AnyFeatureCollection, prefix: string): AnyFeatureCollection {
+  const seen = new Set<string>();
+  const runStamp = Date.now();
+
   return {
     ...data,
     features: data.features.map((feature, index) => {
       const existingId = feature.properties?.appFeatureId;
+      const normalizedExistingId =
+        typeof existingId === 'string' && existingId.trim() ? existingId.trim() : null;
+
       const appFeatureId =
-        typeof existingId === 'string' && existingId.trim() ? existingId : `${prefix}-${Date.now()}-${index}`;
+        normalizedExistingId && !seen.has(normalizedExistingId)
+          ? normalizedExistingId
+          : `${prefix}-${runStamp}-${index}-${Math.random().toString(36).slice(2, 8)}`;
+
+      seen.add(appFeatureId);
 
       return {
         ...feature,
@@ -194,10 +351,23 @@ function ToolbarActionButton({
   );
 }
 
-function PolygonIconActionButton({ onClick, ariaLabel, tooltip, className, children }: PolygonIconActionButtonProps) {
+function PolygonIconActionButton({
+  onClick,
+  ariaLabel,
+  tooltip,
+  className,
+  disabled = false,
+  children,
+}: PolygonIconActionButtonProps) {
   return (
     <div className="group relative">
-      <button onClick={onClick} title={tooltip} aria-label={ariaLabel} className={className}>
+      <button
+        onClick={onClick}
+        title={tooltip}
+        aria-label={ariaLabel}
+        disabled={disabled}
+        className={`${className} ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
+      >
         {children}
       </button>
       <span
@@ -220,6 +390,9 @@ export default function App() {
   const [error, setError] = useState<string>('');
   const [isDragOverUpload, setIsDragOverUpload] = useState<boolean>(false);
   const [showStates, setShowStates] = useState<boolean>(false);
+  const [isSplittingAll, setIsSplittingAll] = useState<boolean>(false);
+  const [splittingFeatureIds, setSplittingFeatureIds] = useState<Set<string>>(new Set());
+  const [operationAlert, setOperationAlert] = useState<OperationAlertState | null>(null);
   const [polygonNames, setPolygonNames] = useState<Record<string, string>>({});
   const [editingPolygonId, setEditingPolygonId] = useState<string | null>(null);
   const [editingPolygonNameDraft, setEditingPolygonNameDraft] = useState<string>('');
@@ -251,6 +424,7 @@ export default function App() {
   const selectedFeatureIdRef = useRef<string | null>(null);
   const pendingFitBoundsRef = useRef<LngLatBoundsLike | null>(null);
   const uploadDragDepthRef = useRef<number>(0);
+  const polygonColorByIdRef = useRef<Record<string, string>>({});
 
   function createWorkspaceSnapshot(): WorkspaceSnapshot {
     return {
@@ -365,6 +539,26 @@ export default function App() {
     displayDataRef.current = displayData;
   }, [displayData]);
 
+  const polygonColorById = useMemo(() => buildPolygonColorById(displayData), [displayData]);
+
+  useEffect(() => {
+    polygonColorByIdRef.current = polygonColorById;
+  }, [polygonColorById]);
+
+  useEffect(() => {
+    if (!operationAlert) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setOperationAlert(null);
+    }, 4500);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [operationAlert]);
+
   useEffect(() => {
     showStatesRef.current = showStates;
   }, [showStates]);
@@ -383,6 +577,9 @@ export default function App() {
         return [];
       }
 
+      const stateName =
+        typeof feature.properties?.stateName === 'string' ? feature.properties.stateName : undefined;
+
       return [
         {
           appFeatureId,
@@ -390,8 +587,8 @@ export default function App() {
           sourceFileName: typeof sourceFileName === 'string' ? sourceFileName : 'Unknown File',
           defaultName: getPolygonDefaultName(feature as Feature<Geometry, GeoJsonProperties>, index),
           isMultiPolygon: feature.geometry?.type === 'MultiPolygon',
-          stateName:
-            typeof feature.properties?.stateName === 'string' ? feature.properties.stateName : undefined,
+          stateName,
+          stateBadge: getStateCodeLabel(stateName),
           splitByState: Boolean(feature.properties?.splitByState),
         },
       ];
@@ -587,11 +784,26 @@ export default function App() {
     hoveredFeatureIdRef.current = nextFeatureId;
   }
 
+  async function refreshStateBoundarySource(map: Map) {
+    const stateSource = map.getSource('state-boundaries') as GeoJSONSource | undefined;
+    if (!stateSource) {
+      return;
+    }
+
+    try {
+      const states = await getStateBoundaries();
+      stateSource.setData(states);
+      setError('');
+    } catch {
+      setError('Could not load detailed state boundaries.');
+    }
+  }
+
   function ensureMapDataLayers(map: Map) {
     if (!map.getSource('state-boundaries')) {
       map.addSource('state-boundaries', {
         type: 'geojson',
-        data: getStateBoundaries(),
+        data: getEmptyStateBoundaries(),
       });
     }
 
@@ -629,9 +841,7 @@ export default function App() {
             POLYGON_SELECTED_FILL_COLOR,
             ['boolean', ['feature-state', 'hover'], false],
             POLYGON_HOVER_FILL_COLOR,
-            ['boolean', ['get', 'splitByState'], false],
-            POLYGON_SPLIT_FILL_COLOR,
-            POLYGON_FILL_COLOR,
+            ['coalesce', ['get', 'polygonColor'], POLYGON_FILL_COLOR],
           ],
           'fill-opacity': [
             'case',
@@ -686,11 +896,10 @@ export default function App() {
       });
     }
 
-    const stateSource = map.getSource('state-boundaries') as GeoJSONSource | undefined;
-    stateSource?.setData(getStateBoundaries());
+    void refreshStateBoundarySource(map);
 
     const dataSource = map.getSource('geojson-data') as GeoJSONSource | undefined;
-    dataSource?.setData(displayDataRef.current);
+    dataSource?.setData(withPolygonColors(displayDataRef.current, polygonColorByIdRef.current));
     clearHoveredFeature(map);
 
     if (selectedFeatureIdRef.current) {
@@ -798,7 +1007,7 @@ export default function App() {
     }
 
     const source = map.getSource('geojson-data') as GeoJSONSource | undefined;
-    source?.setData(smoothPreviewData);
+    source?.setData(withPolygonColors(smoothPreviewData, polygonColorByIdRef.current));
     clearHoveredFeature(map);
   }, [smoothPreviewData]);
 
@@ -1082,17 +1291,34 @@ export default function App() {
   }
 
   async function handleSplitAll() {
-    if (!displayData.features.length) {
+    if (!displayData.features.length || isSplittingAll) {
       return;
     }
+
+    setIsSplittingAll(true);
+    setOperationAlert(null);
+    await waitForUiPaint();
 
     try {
       const result = await splitPolygonsByStates(displayData);
       recordHistorySnapshot();
       setDisplayData(withFeatureIds(result.data, 'split-all'));
       setError('');
+      setOperationAlert({
+        type: 'success',
+        message:
+          result.summary.splitCount > 0
+            ? `Split complete. Created ${result.summary.splitCount} state pieces.`
+            : 'Split complete. No state-boundary splits were needed.',
+      });
     } catch {
       setError('Split failed. Could not split polygons by state.');
+      setOperationAlert({
+        type: 'error',
+        message: 'Split failed. Could not split polygons by state.',
+      });
+    } finally {
+      setIsSplittingAll(false);
     }
   }
 
@@ -1143,6 +1369,10 @@ export default function App() {
   }
 
   async function handleSplitFeatureById(appFeatureId: string) {
+    if (splittingFeatureIds.has(appFeatureId)) {
+      return;
+    }
+
     const targetFeature = displayData.features.find(
       (feature) => feature.properties?.appFeatureId === appFeatureId,
     ) as Feature<Geometry, GeoJsonProperties> | undefined;
@@ -1150,6 +1380,14 @@ export default function App() {
     if (!targetFeature || !isPolygonFeature(targetFeature)) {
       return;
     }
+
+    setSplittingFeatureIds((previous) => {
+      const next = new Set(previous);
+      next.add(appFeatureId);
+      return next;
+    });
+    setOperationAlert(null);
+    await waitForUiPaint();
 
     let splitResult: Awaited<ReturnType<typeof splitPolygonsByStates>>;
     try {
@@ -1159,6 +1397,15 @@ export default function App() {
       });
     } catch {
       setError('Split failed. Could not split the selected polygon by state.');
+      setOperationAlert({
+        type: 'error',
+        message: 'Split failed. Could not split the selected polygon by state.',
+      });
+      setSplittingFeatureIds((previous) => {
+        const next = new Set(previous);
+        next.delete(appFeatureId);
+        return next;
+      });
       return;
     }
 
@@ -1186,6 +1433,19 @@ export default function App() {
 
     closePolygonMenu();
     closeContextMenu();
+    setError('');
+    setOperationAlert({
+      type: 'success',
+      message:
+        splitFeatures.length > 1
+          ? `Split complete. Created ${splitFeatures.length} state pieces.`
+          : 'Split complete. No additional state pieces were created.',
+    });
+    setSplittingFeatureIds((previous) => {
+      const next = new Set(previous);
+      next.delete(appFeatureId);
+      return next;
+    });
   }
 
   function handleSeparatePartsById(appFeatureId: string) {
@@ -1441,6 +1701,21 @@ export default function App() {
           </div>
 
           {error ? <p className="text-sm font-semibold text-red-700">{error}</p> : null}
+          {isSplittingAll || splittingFeatureIds.size > 0 ? (
+            <p role="status" className="text-sm font-semibold text-indigo-700">
+              Splitting polygons by state boundaries...
+            </p>
+          ) : null}
+          {operationAlert ? (
+            <p
+              role="alert"
+              className={`text-sm font-semibold ${
+                operationAlert.type === 'success' ? 'text-emerald-700' : 'text-red-700'
+              }`}
+            >
+              {operationAlert.message}
+            </p>
+          ) : null}
         </section>
 
         <section className="mt-4 flex min-h-0 flex-1 flex-col rounded-2xl border border-slate-200 bg-white/85 p-4 shadow-sm">
@@ -1474,12 +1749,16 @@ export default function App() {
               </ToolbarActionButton>
               <ToolbarActionButton
                 onClick={handleSplitAll}
-                disabled={!polygonItems.length}
-                ariaLabel="Split All by State"
-                tooltip="Split All by State"
+                disabled={!polygonItems.length || isSplittingAll || splittingFeatureIds.size > 0}
+                ariaLabel={isSplittingAll || splittingFeatureIds.size > 0 ? 'Splitting polygons' : 'Split All by State'}
+                tooltip={isSplittingAll || splittingFeatureIds.size > 0 ? 'Splitting...' : 'Split All by State'}
                 className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-slate-900 text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
               >
-                <Scissors className="h-4 w-4" />
+                {isSplittingAll || splittingFeatureIds.size > 0 ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Scissors className="h-4 w-4" />
+                )}
               </ToolbarActionButton>
               <ToolbarActionButton
                 onClick={handleClearAll}
@@ -1565,9 +1844,10 @@ export default function App() {
                       group.polygons.map((item, index) => {
                         const isChecked = selectedForMerge.has(item.appFeatureId);
                         const isSelected = !mergeMode && selectedFeatureId === item.appFeatureId;
+                        const isSplitBusy = splittingFeatureIds.has(item.appFeatureId);
                         const polygonColor = isSelected
                           ? POLYGON_SELECTED_FILL_COLOR
-                          : getPolygonBaseColor(item.splitByState);
+                          : polygonColorById[item.appFeatureId] || getPolygonColorForId(item.appFeatureId);
                         return (
                         <div
                           key={item.appFeatureId}
@@ -1621,21 +1901,22 @@ export default function App() {
                                 ) : null}
                               </div>
                             )}
-                            {item.splitByState && item.stateName ? (
+                            {item.splitByState && item.stateBadge ? (
                               <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-700">
-                                {item.stateName}
+                                {item.stateBadge}
                               </span>
                             ) : null}
 
                             {!mergeMode && (
                               <div className="ml-auto flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
                                 <PolygonIconActionButton
-                                  onClick={() => handleSplitFeatureById(item.appFeatureId)}
-                                  tooltip="Split by State"
-                                  ariaLabel="Split by State"
+                                  onClick={() => void handleSplitFeatureById(item.appFeatureId)}
+                                  tooltip={isSplitBusy ? 'Splitting...' : 'Split by State'}
+                                  ariaLabel={isSplitBusy ? 'Splitting polygon by state' : 'Split by State'}
+                                  disabled={isSplitBusy}
                                   className="inline-flex p-1 items-center justify-center rounded-md border border-indigo-200 bg-indigo-50 text-indigo-700 transition hover:bg-indigo-100"
                                 >
-                                  <Scissors className="h-3 w-3" />
+                                  {isSplitBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Scissors className="h-3 w-3" />}
                                 </PolygonIconActionButton>
                                 {item.isMultiPolygon ? (
                                   <PolygonIconActionButton
@@ -1839,11 +2120,22 @@ export default function App() {
                 Rename
               </button>
               <button
-                onClick={() => contextMenu.appFeatureId && handleSplitFeatureById(contextMenu.appFeatureId)}
-                className="inline-flex items-center justify-center gap-1 rounded-md bg-indigo-600 px-2 py-2 text-xs font-medium text-white transition hover:bg-indigo-500"
+                onClick={() => contextMenu.appFeatureId && void handleSplitFeatureById(contextMenu.appFeatureId)}
+                disabled={
+                  !contextMenu.appFeatureId ||
+                  splittingFeatureIds.has(contextMenu.appFeatureId) ||
+                  isSplittingAll
+                }
+                className="inline-flex items-center justify-center gap-1 rounded-md bg-indigo-600 px-2 py-2 text-xs font-medium text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-indigo-300"
               >
-                <Scissors className="h-3.5 w-3.5" />
-                Split by State
+                {contextMenu.appFeatureId && splittingFeatureIds.has(contextMenu.appFeatureId) ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Scissors className="h-3.5 w-3.5" />
+                )}
+                {contextMenu.appFeatureId && splittingFeatureIds.has(contextMenu.appFeatureId)
+                  ? 'Splitting...'
+                  : 'Split by State'}
               </button>
               <button
                 onClick={() => contextMenu.appFeatureId && handleDeleteFeatureById(contextMenu.appFeatureId)}
