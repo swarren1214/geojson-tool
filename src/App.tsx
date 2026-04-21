@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map } from 'maplibre-gl';
-import type { Feature, GeoJsonProperties, Geometry } from 'geojson';
+import type { Feature, GeoJsonProperties, Geometry, MultiPolygon, Polygon } from 'geojson';
 import {
   Braces,
   Check,
@@ -158,6 +158,11 @@ type WorkspaceSnapshot = {
   displayData: AnyFeatureCollection;
   uploadedFiles: UploadedFileMeta[];
   polygonNames: Record<string, string>;
+};
+
+type GeometryMetrics = {
+  vertices: number;
+  edges: number;
 };
 
 type ToolbarActionButtonProps = {
@@ -326,6 +331,44 @@ function withFeatureIds(data: AnyFeatureCollection, prefix: string): AnyFeatureC
 
 function isPolygonFeature(feature: Feature<Geometry, GeoJsonProperties>): boolean {
   return feature.geometry?.type === 'Polygon' || feature.geometry?.type === 'MultiPolygon';
+}
+
+function countFeatureGeometryMetrics(
+  feature: Feature<Geometry, GeoJsonProperties> | undefined,
+): GeometryMetrics {
+  if (!feature || !isPolygonFeature(feature)) {
+    return { vertices: 0, edges: 0 };
+  }
+
+  let vertices = 0;
+  let edges = 0;
+
+  const countRing = (ring: number[][]) => {
+    if (!Array.isArray(ring) || ring.length < 2) {
+      return;
+    }
+
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    const isClosed = first[0] === last[0] && first[1] === last[1];
+    const ringVertices = isClosed ? Math.max(0, ring.length - 1) : ring.length;
+
+    vertices += ringVertices;
+    edges += ringVertices > 1 ? (isClosed ? ringVertices : ringVertices - 1) : 0;
+  };
+
+  if (feature.geometry.type === 'Polygon') {
+    const polygonFeature = feature as Feature<Polygon, GeoJsonProperties>;
+    polygonFeature.geometry.coordinates.forEach((ring) => countRing(ring));
+    return { vertices, edges };
+  }
+
+  const multiPolygonFeature = feature as Feature<MultiPolygon, GeoJsonProperties>;
+  multiPolygonFeature.geometry.coordinates.forEach((polygon) => {
+    polygon.forEach((ring) => countRing(ring));
+  });
+
+  return { vertices, edges };
 }
 
 function ToolbarActionButton({
@@ -626,6 +669,30 @@ export default function App() {
       }),
     };
   }, [displayData, smoothPanel]);
+
+  const smoothGeometryMetrics = useMemo<
+    | {
+        original: GeometryMetrics;
+        preview: GeometryMetrics;
+      }
+    | null
+  >(() => {
+    if (!smoothPanel.open || !smoothPanel.appFeatureId) {
+      return null;
+    }
+
+    const originalFeature = displayData.features.find(
+      (feature) => feature.properties?.appFeatureId === smoothPanel.appFeatureId,
+    ) as Feature<Geometry, GeoJsonProperties> | undefined;
+    const previewFeature = smoothPreviewData.features.find(
+      (feature) => feature.properties?.appFeatureId === smoothPanel.appFeatureId,
+    ) as Feature<Geometry, GeoJsonProperties> | undefined;
+
+    return {
+      original: countFeatureGeometryMetrics(originalFeature),
+      preview: countFeatureGeometryMetrics(previewFeature),
+    };
+  }, [displayData, smoothPreviewData, smoothPanel.appFeatureId, smoothPanel.open]);
 
   useEffect(() => {
     polygonNameByIdRef.current = polygonNameById;
@@ -2063,6 +2130,35 @@ export default function App() {
                   ? 'Higher values remove more vertices.'
                   : 'Higher values create a stronger smoothing effect.'}
               </p>
+
+              {smoothGeometryMetrics ? (
+                <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5">
+                    <p className="font-semibold uppercase tracking-wide text-slate-500">Vertices</p>
+                    <p className="text-sm font-bold text-slate-800">
+                      {smoothGeometryMetrics.preview.vertices}
+                      <span className="ml-1 text-[11px] font-medium text-slate-500">
+                        ({smoothGeometryMetrics.preview.vertices - smoothGeometryMetrics.original.vertices >= 0
+                          ? '+'
+                          : ''}
+                        {smoothGeometryMetrics.preview.vertices - smoothGeometryMetrics.original.vertices})
+                      </span>
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5">
+                    <p className="font-semibold uppercase tracking-wide text-slate-500">Edges</p>
+                    <p className="text-sm font-bold text-slate-800">
+                      {smoothGeometryMetrics.preview.edges}
+                      <span className="ml-1 text-[11px] font-medium text-slate-500">
+                        ({smoothGeometryMetrics.preview.edges - smoothGeometryMetrics.original.edges >= 0
+                          ? '+'
+                          : ''}
+                        {smoothGeometryMetrics.preview.edges - smoothGeometryMetrics.original.edges})
+                      </span>
+                    </p>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             <div className="mt-4 flex justify-end gap-2">

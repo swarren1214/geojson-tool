@@ -200,7 +200,11 @@ function sensitivityToIterations(sensitivity: number): number {
 }
 
 function sensitivityToSimplifyTolerance(sensitivity: number): number {
-  return 0.00001 + (sensitivity / 100) * 0.01;
+  if (sensitivity <= 0) {
+    return 0;
+  }
+
+  return (sensitivity / 100) * 0.01;
 }
 
 function closeRing(points: number[][]): number[][] {
@@ -346,6 +350,10 @@ export function smoothPolygonFeature(
   const iterations = options.iterations ?? sensitivityToIterations(sensitivity);
 
   if (algorithm === 'simplify') {
+    if (sensitivity <= 0) {
+      return feature;
+    }
+
     const simplified = simplify(feature, {
       tolerance: sensitivityToSimplifyTolerance(sensitivity),
       highQuality: true,
