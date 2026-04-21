@@ -1415,12 +1415,18 @@ export default function App() {
       recordHistorySnapshot();
       setDisplayData(withFeatureIds(result.data, 'split-all'));
       setError('');
+      const noIntersectionMessage =
+        result.summary.noIntersectionCount > 0
+          ? ` ${result.summary.noIntersectionCount} polygon${
+              result.summary.noIntersectionCount === 1 ? '' : 's'
+            } had no intersecting state boundaries.`
+          : '';
       setOperationAlert({
         type: 'success',
         message:
           result.summary.splitCount > 0
-            ? `Split complete. Created ${result.summary.splitCount} state pieces.`
-            : 'Split complete. No state-boundary splits were needed.',
+            ? `Split complete. Created ${result.summary.splitCount} state pieces.${noIntersectionMessage}`
+            : `Split complete. No state-boundary splits were needed.${noIntersectionMessage}`,
       });
     } catch {
       setError('Split failed. Could not split polygons by state.');
@@ -1500,11 +1506,52 @@ export default function App() {
     setOperationAlert(null);
     await waitForUiPaint();
 
-    let splitResult: Awaited<ReturnType<typeof splitPolygonsByStates>>;
     try {
-      splitResult = await splitPolygonsByStates({
+      const splitResult = await splitPolygonsByStates({
         type: 'FeatureCollection',
         features: [targetFeature],
+      });
+
+      if (splitResult.summary.noIntersectionCount > 0) {
+        setError('');
+        setOperationAlert({
+          type: 'success',
+          message: 'No state boundaries intersect with this polygon.',
+        });
+        return;
+      }
+
+      const splitFeatures = splitResult.data.features.map((feature, index) => ({
+        ...feature,
+        properties: {
+          ...feature.properties,
+          appFeatureId: `${appFeatureId}-piece-${Date.now()}-${index}`,
+        },
+      }));
+
+      recordHistorySnapshot();
+      setDisplayData((previous) => ({
+        type: 'FeatureCollection',
+        features: [
+          ...previous.features.filter((feature) => feature.properties?.appFeatureId !== appFeatureId),
+          ...splitFeatures,
+        ],
+      }));
+
+      const map = mapRef.current;
+      if (map && selectedFeatureIdRef.current === appFeatureId) {
+        clearSelectedFeature(map);
+      }
+
+      closePolygonMenu();
+      closeContextMenu();
+      setError('');
+      setOperationAlert({
+        type: 'success',
+        message:
+          splitFeatures.length > 1
+            ? `Split complete. Created ${splitFeatures.length} state pieces.`
+            : 'Split complete. No additional state pieces were created.',
       });
     } catch {
       setError('Split failed. Could not split the selected polygon by state.');
@@ -1512,51 +1559,13 @@ export default function App() {
         type: 'error',
         message: 'Split failed. Could not split the selected polygon by state.',
       });
+    } finally {
       setSplittingFeatureIds((previous) => {
         const next = new Set(previous);
         next.delete(appFeatureId);
         return next;
       });
-      return;
     }
-
-    const splitFeatures = splitResult.data.features.map((feature, index) => ({
-      ...feature,
-      properties: {
-        ...feature.properties,
-        appFeatureId: `${appFeatureId}-piece-${Date.now()}-${index}`,
-      },
-    }));
-
-    recordHistorySnapshot();
-    setDisplayData((previous) => ({
-      type: 'FeatureCollection',
-      features: [
-        ...previous.features.filter((feature) => feature.properties?.appFeatureId !== appFeatureId),
-        ...splitFeatures,
-      ],
-    }));
-
-    const map = mapRef.current;
-    if (map && selectedFeatureIdRef.current === appFeatureId) {
-      clearSelectedFeature(map);
-    }
-
-    closePolygonMenu();
-    closeContextMenu();
-    setError('');
-    setOperationAlert({
-      type: 'success',
-      message:
-        splitFeatures.length > 1
-          ? `Split complete. Created ${splitFeatures.length} state pieces.`
-          : 'Split complete. No additional state pieces were created.',
-    });
-    setSplittingFeatureIds((previous) => {
-      const next = new Set(previous);
-      next.delete(appFeatureId);
-      return next;
-    });
   }
 
   function handleSeparatePartsById(appFeatureId: string) {

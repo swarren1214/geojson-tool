@@ -72,6 +72,7 @@ export async function splitPolygonsByStates(source: AnyFeatureCollection): Promi
   let originalPolygonCount = 0;
   let splitPolygonCount = 0;
   let untouchedPolygonCount = 0;
+  let noIntersectionPolygonCount = 0;
 
   source.features.forEach((sourceFeature, sourceIndex) => {
     if (!sourceFeature.geometry) {
@@ -88,11 +89,14 @@ export async function splitPolygonsByStates(source: AnyFeatureCollection): Promi
 
     const polygonFeature = sourceFeature as PolygonFeature;
     const pieces: Feature<Polygon | MultiPolygon, GeoJsonProperties>[] = [];
+    let didIntersectAnyState = false;
 
     states.features.forEach((state, stateIndex) => {
       if (!booleanIntersects(polygonFeature, state)) {
         return;
       }
+
+      didIntersectAnyState = true;
 
       const clipped = intersect(featureCollection([polygonFeature, state]));
       if (!clipped || (clipped.geometry.type !== 'Polygon' && clipped.geometry.type !== 'MultiPolygon')) {
@@ -109,6 +113,10 @@ export async function splitPolygonsByStates(source: AnyFeatureCollection): Promi
         },
       });
     });
+
+    if (!didIntersectAnyState) {
+      noIntersectionPolygonCount += 1;
+    }
 
     if (pieces.length <= 1) {
       untouchedPolygonCount += 1;
@@ -137,6 +145,7 @@ export async function splitPolygonsByStates(source: AnyFeatureCollection): Promi
       originalCount: originalPolygonCount,
       splitCount: splitPolygonCount,
       untouchedCount: untouchedPolygonCount,
+      noIntersectionCount: noIntersectionPolygonCount,
     },
   };
 }

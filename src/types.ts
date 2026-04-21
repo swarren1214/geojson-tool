@@ -11,4 +11,5 @@ export type SplitSummary = {
   originalCount: number;
   splitCount: number;
   untouchedCount: number;
+  noIntersectionCount: number;
 };
