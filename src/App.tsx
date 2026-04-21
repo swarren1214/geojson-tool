@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map } from 'maplibre-gl';
 import { AnimatePresence, motion } from 'framer-motion';
-import type { Feature, GeoJsonProperties, Geometry, MultiPolygon, Polygon } from 'geojson';
+import type { Feature, GeoJsonProperties, Geometry, MultiPolygon, Point, Polygon } from 'geojson';
 import {
   Braces,
   Check,
@@ -122,11 +122,140 @@ function waitForUiPaint(): Promise<void> {
   });
 }
 
+function parseCsvRows(rawText: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < rawText.length; i++) {
+    const char = rawText[i];
+
+    if (char === '"') {
+      const isEscapedQuote = inQuotes && rawText[i + 1] === '"';
+      if (isEscapedQuote) {
+        cell += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === ',' && !inQuotes) {
+      row.push(cell.trim());
+      cell = '';
+      continue;
+    }
+
+    if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && rawText[i + 1] === '\n') {
+        i += 1;
+      }
+
+      row.push(cell.trim());
+      cell = '';
+
+      if (row.some((value) => value !== '')) {
+        rows.push(row);
+      }
+
+      row = [];
+      continue;
+    }
+
+    cell += char;
+  }
+
+  row.push(cell.trim());
+  if (row.some((value) => value !== '')) {
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function parseCsvPointCollection(rawText: string, fileName: string, fileId: string): {
+  data: AnyFeatureCollection;
+  importedCount: number;
+  skippedCount: number;
+} {
+  const rows = parseCsvRows(rawText);
+  if (!rows.length) {
+    throw new Error('CSV is empty.');
+  }
+
+  const normalizedHeader = rows[0].map((value) => value.trim().toLowerCase());
+  const latHeaderNames = new Set(['lat', 'latitude', 'y']);
+  const lonHeaderNames = new Set(['lon', 'lng', 'long', 'longitude', 'x']);
+
+  const latHeaderIndex = normalizedHeader.findIndex((value) => latHeaderNames.has(value));
+  const lonHeaderIndex = normalizedHeader.findIndex((value) => lonHeaderNames.has(value));
+  const hasHeader = latHeaderIndex >= 0 && lonHeaderIndex >= 0;
+
+  const latIndex = hasHeader ? latHeaderIndex : 0;
+  const lonIndex = hasHeader ? lonHeaderIndex : 1;
+
+  if (!hasHeader && rows[0].length < 2) {
+    throw new Error('CSV must include lat/lon columns or at least two coordinate columns.');
+  }
+
+  const features: Feature<Point, GeoJsonProperties>[] = [];
+  let skippedCount = 0;
+  const startRow = hasHeader ? 1 : 0;
+
+  for (let i = startRow; i < rows.length; i++) {
+    const row = rows[i];
+    const latValue = row[latIndex];
+    const lonValue = row[lonIndex];
+
+    const lat = typeof latValue === 'string' ? Number.parseFloat(latValue) : Number.NaN;
+    const lon = typeof lonValue === 'string' ? Number.parseFloat(lonValue) : Number.NaN;
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      skippedCount += 1;
+      continue;
+    }
+
+    features.push({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [lon, lat],
+      },
+      properties: {
+        csvSourceFileId: fileId,
+        csvSourceFile: fileName,
+        csvRowNumber: i + 1,
+      },
+    });
+  }
+
+  if (!features.length) {
+    throw new Error('No valid coordinates found in CSV.');
+  }
+
+  return {
+    data: {
+      type: 'FeatureCollection',
+      features,
+    },
+    importedCount: features.length,
+    skippedCount,
+  };
+}
+
 type UploadedFileMeta = {
   id: string;
   name: string;
   featureCount: number;
   polygonCount: number;
+};
+
+type CsvPointFileMeta = {
+  id: string;
+  name: string;
+  pointCount: number;
 };
 
 type ContextMenuState = {
@@ -159,6 +288,8 @@ type SmoothPanelState = {
 
 type WorkspaceSnapshot = {
   displayData: AnyFeatureCollection;
+  csvPointData: AnyFeatureCollection;
+  csvPointFiles: CsvPointFileMeta[];
   uploadedFiles: UploadedFileMeta[];
   polygonNames: Record<string, string>;
 };
@@ -429,12 +560,16 @@ function PolygonIconActionButton({
 export default function App() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const csvPointFileInputRef = useRef<HTMLInputElement | null>(null);
   const mapRef = useRef<Map | null>(null);
 
   const [displayData, setDisplayData] = useState<AnyFeatureCollection>(EMPTY_COLLECTION);
+  const [csvPointData, setCsvPointData] = useState<AnyFeatureCollection>(EMPTY_COLLECTION);
+  const [csvPointFiles, setCsvPointFiles] = useState<CsvPointFileMeta[]>([]);
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFileMeta[]>([]);
   const [error, setError] = useState<string>('');
   const [isDragOverUpload, setIsDragOverUpload] = useState<boolean>(false);
+  const [isDragOverCsvUpload, setIsDragOverCsvUpload] = useState<boolean>(false);
   const [showStates, setShowStates] = useState<boolean>(false);
   const [isSplittingAll, setIsSplittingAll] = useState<boolean>(false);
   const [splittingFeatureIds, setSplittingFeatureIds] = useState<Set<string>>(new Set());
@@ -465,17 +600,21 @@ export default function App() {
   });
 
   const displayDataRef = useRef<AnyFeatureCollection>(displayData);
+  const csvPointDataRef = useRef<AnyFeatureCollection>(csvPointData);
   const showStatesRef = useRef<boolean>(showStates);
   const polygonNameByIdRef = useRef<Record<string, string>>({});
   const hoveredFeatureIdRef = useRef<string | null>(null);
   const selectedFeatureIdRef = useRef<string | null>(null);
   const pendingFitBoundsRef = useRef<LngLatBoundsLike | null>(null);
   const uploadDragDepthRef = useRef<number>(0);
+  const csvUploadDragDepthRef = useRef<number>(0);
   const polygonColorByIdRef = useRef<Record<string, string>>({});
 
   function createWorkspaceSnapshot(): WorkspaceSnapshot {
     return {
       displayData,
+      csvPointData,
+      csvPointFiles,
       uploadedFiles,
       polygonNames,
     };
@@ -483,6 +622,8 @@ export default function App() {
 
   function applyWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     setDisplayData(snapshot.displayData);
+    setCsvPointData(snapshot.csvPointData);
+    setCsvPointFiles(snapshot.csvPointFiles);
     setUploadedFiles(snapshot.uploadedFiles);
     setPolygonNames(snapshot.polygonNames);
     setMergeMode(false);
@@ -585,6 +726,10 @@ export default function App() {
   useEffect(() => {
     displayDataRef.current = displayData;
   }, [displayData]);
+
+  useEffect(() => {
+    csvPointDataRef.current = csvPointData;
+  }, [csvPointData]);
 
   const polygonColorById = useMemo(() => buildPolygonColorById(displayData), [displayData]);
 
@@ -939,6 +1084,16 @@ export default function App() {
       });
     }
 
+    if (!map.getSource('csv-point-data')) {
+      map.addSource('csv-point-data', {
+        type: 'geojson',
+        data: EMPTY_COLLECTION,
+        cluster: true,
+        clusterMaxZoom: 12,
+        clusterRadius: 48,
+      });
+    }
+
     if (!map.getLayer('geojson-fill')) {
       map.addLayer({
         id: 'geojson-fill',
@@ -1007,10 +1162,77 @@ export default function App() {
       });
     }
 
+    if (!map.getLayer('csv-point-clusters')) {
+      map.addLayer({
+        id: 'csv-point-clusters',
+        type: 'circle',
+        source: 'csv-point-data',
+        filter: ['has', 'point_count'],
+        paint: {
+          'circle-color': [
+            'step',
+            ['get', 'point_count'],
+            '#f59e0b',
+            100,
+            '#f97316',
+            1000,
+            '#dc2626',
+          ],
+          'circle-radius': [
+            'step',
+            ['get', 'point_count'],
+            14,
+            100,
+            18,
+            1000,
+            24,
+          ],
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 1.5,
+          'circle-opacity': 0.9,
+        },
+      });
+    }
+
+    if (!map.getLayer('csv-point-cluster-count')) {
+      map.addLayer({
+        id: 'csv-point-cluster-count',
+        type: 'symbol',
+        source: 'csv-point-data',
+        filter: ['has', 'point_count'],
+        layout: {
+          'text-field': '{point_count_abbreviated}',
+          'text-font': ['Open Sans Bold'],
+          'text-size': 11,
+        },
+        paint: {
+          'text-color': '#ffffff',
+        },
+      });
+    }
+
+    if (!map.getLayer('csv-point-unclustered')) {
+      map.addLayer({
+        id: 'csv-point-unclustered',
+        type: 'circle',
+        source: 'csv-point-data',
+        filter: ['!', ['has', 'point_count']],
+        paint: {
+          'circle-radius': 3.5,
+          'circle-color': '#dc2626',
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 1,
+          'circle-opacity': 0.85,
+        },
+      });
+    }
+
     void refreshStateBoundarySource(map);
 
     const dataSource = map.getSource('geojson-data') as GeoJSONSource | undefined;
     dataSource?.setData(withPolygonColors(displayDataRef.current, polygonColorByIdRef.current));
+    const csvPointSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
+    csvPointSource?.setData(csvPointDataRef.current);
     clearHoveredFeature(map);
 
     if (selectedFeatureIdRef.current) {
@@ -1046,6 +1268,50 @@ export default function App() {
       if (pendingFitBoundsRef.current) {
         fitMapToBounds(pendingFitBoundsRef.current);
       }
+    });
+
+    map.on('click', 'csv-point-clusters', (event) => {
+      const clusterFeature = event.features?.[0];
+      if (!clusterFeature || clusterFeature.geometry?.type !== 'Point') {
+        return;
+      }
+
+      const clusterIdValue = clusterFeature.properties?.cluster_id;
+      const clusterId = typeof clusterIdValue === 'number' ? clusterIdValue : Number(clusterIdValue);
+      if (!Number.isFinite(clusterId)) {
+        return;
+      }
+
+      const coordinates = clusterFeature.geometry.coordinates;
+
+      const source = map.getSource('csv-point-data') as GeoJSONSource | undefined;
+      if (!source) {
+        return;
+      }
+
+      void source.getClusterExpansionZoom(clusterId).then((zoom) => {
+        map.easeTo({
+          center: [coordinates[0], coordinates[1]],
+          zoom,
+          duration: 400,
+        });
+      });
+    });
+
+    map.on('mouseenter', 'csv-point-clusters', () => {
+      map.getCanvas().style.cursor = 'pointer';
+    });
+
+    map.on('mouseleave', 'csv-point-clusters', () => {
+      map.getCanvas().style.cursor = '';
+    });
+
+    map.on('mouseenter', 'csv-point-unclustered', () => {
+      map.getCanvas().style.cursor = 'pointer';
+    });
+
+    map.on('mouseleave', 'csv-point-unclustered', () => {
+      map.getCanvas().style.cursor = '';
     });
 
     map.on('click', (event) => {
@@ -1128,6 +1394,16 @@ export default function App() {
       return;
     }
 
+    const source = map.getSource('csv-point-data') as GeoJSONSource | undefined;
+    source?.setData(csvPointData);
+  }, [csvPointData]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map?.isStyleLoaded()) {
+      return;
+    }
+
     closeContextMenu();
     closePolygonMenu();
   }, [displayData]);
@@ -1164,7 +1440,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undoStack, redoStack, displayData, uploadedFiles, polygonNames]);
+  }, [undoStack, redoStack, displayData, csvPointData, csvPointFiles, uploadedFiles, polygonNames]);
 
   async function importGeoJsonFiles(selectedFiles: File[]) {
     if (!selectedFiles.length) {
@@ -1223,6 +1499,149 @@ export default function App() {
   async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const selectedFiles = Array.from(event.target.files || []);
     await importGeoJsonFiles(selectedFiles);
+  }
+
+  async function importCsvPointFiles(selectedFiles: File[]) {
+    if (!selectedFiles.length) {
+      return;
+    }
+
+    const importedPointFeatures: Feature<Geometry, GeoJsonProperties>[] = [];
+    const importedCsvFiles: CsvPointFileMeta[] = [];
+    const failedFiles: string[] = [];
+    let importedPointCount = 0;
+    let skippedPointCount = 0;
+
+    for (const selectedFile of selectedFiles) {
+      try {
+        const text = await selectedFile.text();
+        const csvFileId = `csv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const parsed = parseCsvPointCollection(text, selectedFile.name, csvFileId);
+        importedPointFeatures.push(...parsed.data.features);
+        importedCsvFiles.push({
+          id: csvFileId,
+          name: selectedFile.name,
+          pointCount: parsed.importedCount,
+        });
+        importedPointCount += parsed.importedCount;
+        skippedPointCount += parsed.skippedCount;
+      } catch {
+        failedFiles.push(selectedFile.name);
+      }
+    }
+
+    if (importedPointFeatures.length > 0) {
+      recordHistorySnapshot();
+      const newCsvPointData: AnyFeatureCollection = {
+        type: 'FeatureCollection',
+        features: [...csvPointDataRef.current.features, ...importedPointFeatures],
+      };
+      setCsvPointData(newCsvPointData);
+      setCsvPointFiles((previous) => [...previous, ...importedCsvFiles]);
+
+      const map = mapRef.current;
+      if (map) {
+        const csvSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
+        csvSource?.setData(newCsvPointData);
+      }
+
+      fitMapToCollection({
+        type: 'FeatureCollection',
+        features: importedPointFeatures,
+      });
+
+      setError('');
+      setOperationAlert({
+        type: 'success',
+        message:
+          skippedPointCount > 0
+            ? `Imported ${importedPointCount} coordinate points from ${importedCsvFiles.length} CSV file${
+                importedCsvFiles.length === 1 ? '' : 's'
+              }. Skipped ${skippedPointCount} invalid row${skippedPointCount === 1 ? '' : 's'}.`
+            : `Imported ${importedPointCount} coordinate points from ${importedCsvFiles.length} CSV file${
+                importedCsvFiles.length === 1 ? '' : 's'
+              }.`,
+      });
+    }
+
+    if (failedFiles.length > 0) {
+      const failureMessage = `Could not parse CSV file${failedFiles.length === 1 ? '' : 's'}: ${failedFiles.join(', ')}`;
+      if (importedPointFeatures.length > 0) {
+        setError('');
+        setOperationAlert({
+          type: 'error',
+          message: failureMessage,
+        });
+      } else {
+        setError(failureMessage);
+      }
+    }
+
+    if (csvPointFileInputRef.current) {
+      csvPointFileInputRef.current.value = '';
+    }
+  }
+
+  async function handleCsvPointFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = Array.from(event.target.files || []);
+    await importCsvPointFiles(selectedFiles);
+  }
+
+  function handleCsvPointUploadClick() {
+    csvPointFileInputRef.current?.click();
+  }
+
+  function handleCsvUploadDragEnter(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    csvUploadDragDepthRef.current += 1;
+    setIsDragOverCsvUpload(true);
+  }
+
+  function handleCsvUploadDragOver(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!isDragOverCsvUpload) {
+      setIsDragOverCsvUpload(true);
+    }
+  }
+
+  function handleCsvUploadDragLeave(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    csvUploadDragDepthRef.current = Math.max(0, csvUploadDragDepthRef.current - 1);
+    if (csvUploadDragDepthRef.current === 0) {
+      setIsDragOverCsvUpload(false);
+    }
+  }
+
+  async function handleCsvUploadDrop(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    csvUploadDragDepthRef.current = 0;
+    setIsDragOverCsvUpload(false);
+
+    const droppedFiles = Array.from(event.dataTransfer.files || []);
+    await importCsvPointFiles(droppedFiles);
+  }
+
+  function handleRemoveCsvPointFile(csvFileId: string) {
+    recordHistorySnapshot();
+
+    const newCsvPointData: AnyFeatureCollection = {
+      type: 'FeatureCollection',
+      features: csvPointDataRef.current.features.filter(
+        (feature) => feature.properties?.csvSourceFileId !== csvFileId,
+      ),
+    };
+    setCsvPointData(newCsvPointData);
+    setCsvPointFiles((previous) => previous.filter((file) => file.id !== csvFileId));
+
+    const map = mapRef.current;
+    if (map) {
+      const csvSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
+      csvSource?.setData(newCsvPointData);
+    }
   }
 
   function handleUploadDropZoneClick() {
@@ -1290,6 +1709,8 @@ export default function App() {
     recordHistorySnapshot();
     setUploadedFiles([]);
     setDisplayData(EMPTY_COLLECTION);
+    setCsvPointData(EMPTY_COLLECTION);
+    setCsvPointFiles([]);
     setError('');
     setPolygonNames({});
     setMergeMode(false);
@@ -1306,6 +1727,15 @@ export default function App() {
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
+
+    if (csvPointFileInputRef.current) {
+      csvPointFileInputRef.current.value = '';
+    }
+
+    setIsDragOverUpload(false);
+    setIsDragOverCsvUpload(false);
+    uploadDragDepthRef.current = 0;
+    csvUploadDragDepthRef.current = 0;
   }
 
   function toggleMergeMode() {
@@ -1811,6 +2241,80 @@ export default function App() {
             className="hidden"
           />
 
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={handleCsvPointUploadClick}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                handleCsvPointUploadClick();
+              }
+            }}
+            onDragEnter={handleCsvUploadDragEnter}
+            onDragOver={handleCsvUploadDragOver}
+            onDragLeave={handleCsvUploadDragLeave}
+            onDrop={handleCsvUploadDrop}
+            className={`group block cursor-pointer rounded-xl border-2 border-dashed p-4 transition ${
+              isDragOverCsvUpload
+                ? 'border-indigo-500 bg-indigo-100/60 ring-2 ring-indigo-200'
+                : 'border-slate-300 bg-slate-50/70 hover:border-indigo-400 hover:bg-indigo-50/50'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <div
+                className={`rounded-lg bg-white p-2 text-slate-700 shadow-sm ring-1 ring-slate-200 transition ${
+                  isDragOverCsvUpload ? 'scale-105 text-indigo-700 ring-indigo-300' : ''
+                }`}
+              >
+                <MapPinned className="h-5 w-5" />
+              </div>
+              <div>
+                <p className={`text-sm font-semibold ${isDragOverCsvUpload ? 'text-indigo-800' : 'text-slate-800'}`}>
+                  {isDragOverCsvUpload ? 'Release to upload files' : 'Drop CSV files here'}
+                </p>
+                <p className={`text-xs ${isDragOverCsvUpload ? 'text-indigo-700' : 'text-slate-500'}`}>
+                  {isDragOverCsvUpload
+                    ? 'Files will be imported and mapped immediately'
+                    : 'or click to browse coordinate files with lat/lon columns'}
+                </p>
+              </div>
+            </div>
+
+            <input
+              ref={csvPointFileInputRef}
+              type="file"
+              multiple
+              accept=".csv,text/csv"
+              onChange={handleCsvPointFileChange}
+              className="hidden"
+            />
+
+            {csvPointFiles.length > 0 ? (
+              <div className="mt-2 max-h-24 space-y-1 overflow-y-auto pr-1">
+                {csvPointFiles.map((csvFile) => (
+                  <div key={csvFile.id} className="flex items-center justify-between rounded-md bg-white px-2 py-1 ring-1 ring-slate-200">
+                    <p className="truncate text-[11px] font-medium text-slate-700" title={csvFile.name}>
+                      {csvFile.name} ({csvFile.pointCount.toLocaleString()} pts)
+                    </p>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleRemoveCsvPointFile(csvFile.id);
+                      }}
+                      aria-label={`Remove ${csvFile.name}`}
+                      title={`Remove ${csvFile.name}`}
+                      className="ml-2 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-red-600 transition hover:bg-red-50"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
           <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
             <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-700">
               <MapPinned className="h-4 w-4" />
@@ -1891,7 +2395,7 @@ export default function App() {
               </ToolbarActionButton>
               <ToolbarActionButton
                 onClick={handleClearAll}
-                disabled={!uploadedFiles.length}
+                disabled={!uploadedFiles.length && !csvPointData.features.length}
                 ariaLabel="Clear All Files"
                 tooltip="Clear All Files"
                 className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-red-600 text-white transition hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-red-200"
