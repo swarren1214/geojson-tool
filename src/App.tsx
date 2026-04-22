@@ -51,6 +51,15 @@ const CSV_MIXED_CLUSTER_COLOR = '#facc15';
 const SMOOTH_PANEL_WIDTH_PX = 288;
 const SMOOTH_PANEL_VIEWPORT_MARGIN_PX = 16;
 const SMOOTH_PANEL_ESTIMATED_HEIGHT_PX = 420;
+const POLYGON_EDIT_OUTLINE_SOURCE_ID = 'polygon-edit-outline';
+const POLYGON_EDIT_VERTICES_SOURCE_ID = 'polygon-edit-vertices';
+const POLYGON_EDIT_SNAP_POINT_SOURCE_ID = 'polygon-edit-snap-point';
+const POLYGON_EDIT_SNAP_SEGMENT_SOURCE_ID = 'polygon-edit-snap-segment';
+const POLYGON_EDIT_OUTLINE_LAYER_ID = 'polygon-edit-outline-layer';
+const POLYGON_EDIT_VERTICES_LAYER_ID = 'polygon-edit-vertices-layer';
+const POLYGON_EDIT_SNAP_POINT_LAYER_ID = 'polygon-edit-snap-point-layer';
+const POLYGON_EDIT_SNAP_SEGMENT_LAYER_ID = 'polygon-edit-snap-segment-layer';
+const POLYGON_EDIT_SNAP_THRESHOLD_PX = 10;
 const WORKSPACE_DB_NAME = 'geojson-tool-workspace';
 const WORKSPACE_DB_VERSION = 1;
 const WORKSPACE_STORE_NAME = 'workspace';
@@ -63,6 +72,427 @@ type PolygonBoundaryIndexItem = {
   maxLon: number;
   maxLat: number;
 };
+
+type PolygonVertexReference = {
+  polygonIndex: number;
+  ringIndex: number;
+  coordIndex: number;
+};
+
+type PolygonSegmentReference = {
+  polygonIndex: number;
+  ringIndex: number;
+  segmentIndex: number;
+};
+
+type PolygonSnapResult = {
+  coordinate: [number, number];
+  kind: 'none' | 'vertex' | 'edge';
+  segment?: [[number, number], [number, number]];
+};
+
+function clonePolygonFeatureGeometry(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+): Feature<Polygon | MultiPolygon, GeoJsonProperties> {
+  if (feature.geometry.type === 'Polygon') {
+    return {
+      ...feature,
+      geometry: {
+        ...feature.geometry,
+        coordinates: feature.geometry.coordinates.map((ring) => ring.map(([lng, lat]) => [lng, lat])),
+      },
+    };
+  }
+
+  return {
+    ...feature,
+    geometry: {
+      ...feature.geometry,
+      coordinates: feature.geometry.coordinates.map((polygon) =>
+        polygon.map((ring) => ring.map(([lng, lat]) => [lng, lat])),
+      ),
+    },
+  };
+}
+
+function getPolygonRings(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+): Array<{ polygonIndex: number; ringIndex: number; ring: number[][] }> {
+  if (feature.geometry.type === 'Polygon') {
+    return feature.geometry.coordinates.map((ring, ringIndex) => ({
+      polygonIndex: 0,
+      ringIndex,
+      ring,
+    }));
+  }
+
+  return feature.geometry.coordinates.flatMap((polygon, polygonIndex) =>
+    polygon.map((ring, ringIndex) => ({ polygonIndex, ringIndex, ring })),
+  );
+}
+
+function buildPolygonVertexCollection(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+): AnyFeatureCollection {
+  const vertexFeatures: Feature<Point, GeoJsonProperties>[] = [];
+
+  getPolygonRings(feature).forEach(({ polygonIndex, ringIndex, ring }) => {
+    if (ring.length < 2) {
+      return;
+    }
+
+    const uniqueVertexCount = Math.max(0, ring.length - 1);
+    for (let coordIndex = 0; coordIndex < uniqueVertexCount; coordIndex++) {
+      const coordinate = ring[coordIndex];
+      if (!coordinate || coordinate.length < 2) {
+        continue;
+      }
+
+      const vertexId = `${polygonIndex}:${ringIndex}:${coordIndex}`;
+      vertexFeatures.push({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [coordinate[0], coordinate[1]],
+        },
+        properties: {
+          vertexId,
+          polygonIndex,
+          ringIndex,
+          coordIndex,
+        },
+      });
+    }
+  });
+
+  return {
+    type: 'FeatureCollection',
+    features: vertexFeatures,
+  };
+}
+
+function updatePolygonVertexCoordinate(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  reference: PolygonVertexReference,
+  coordinate: [number, number],
+): Feature<Polygon | MultiPolygon, GeoJsonProperties> {
+  if (feature.geometry.type === 'Polygon') {
+    const nextCoordinates = feature.geometry.coordinates.map((ring) => ring.map(([lng, lat]) => [lng, lat]));
+    const ring = nextCoordinates[reference.ringIndex];
+    if (!ring) {
+      return feature;
+    }
+
+    ring[reference.coordIndex] = [coordinate[0], coordinate[1]];
+    if (reference.coordIndex === 0 && ring.length > 1) {
+      ring[ring.length - 1] = [coordinate[0], coordinate[1]];
+    }
+
+    return {
+      ...feature,
+      geometry: {
+        ...feature.geometry,
+        coordinates: nextCoordinates,
+      },
+    };
+  }
+
+  const nextCoordinates = feature.geometry.coordinates.map((polygon) =>
+    polygon.map((ring) => ring.map(([lng, lat]) => [lng, lat])),
+  );
+  const ring = nextCoordinates[reference.polygonIndex]?.[reference.ringIndex];
+  if (!ring) {
+    return feature;
+  }
+
+  ring[reference.coordIndex] = [coordinate[0], coordinate[1]];
+  if (reference.coordIndex === 0 && ring.length > 1) {
+    ring[ring.length - 1] = [coordinate[0], coordinate[1]];
+  }
+
+  return {
+    ...feature,
+    geometry: {
+      ...feature.geometry,
+      coordinates: nextCoordinates,
+    },
+  };
+}
+
+function findNearestVertexForCoordinate(
+  map: Map,
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  coordinate: [number, number],
+  maxDistancePx = 16,
+): { reference: PolygonVertexReference; vertexId: string } | null {
+  const targetPoint = map.project([coordinate[0], coordinate[1]]);
+  let bestMatch: { reference: PolygonVertexReference; vertexId: string } | null = null;
+  let bestDistance = maxDistancePx;
+
+  getPolygonRings(feature).forEach(({ polygonIndex, ringIndex, ring }) => {
+    const uniqueVertexCount = Math.max(0, ring.length - 1);
+    for (let coordIndex = 0; coordIndex < uniqueVertexCount; coordIndex++) {
+      const vertex = ring[coordIndex];
+      const projected = map.project([vertex[0], vertex[1]]);
+      const dx = projected.x - targetPoint.x;
+      const dy = projected.y - targetPoint.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      if (distance <= bestDistance) {
+        bestDistance = distance;
+        bestMatch = {
+          reference: { polygonIndex, ringIndex, coordIndex },
+          vertexId: `${polygonIndex}:${ringIndex}:${coordIndex}`,
+        };
+      }
+    }
+  });
+
+  return bestMatch;
+}
+
+function findNearestSegmentForCoordinate(
+  map: Map,
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  coordinate: [number, number],
+  maxDistancePx = POLYGON_EDIT_SNAP_THRESHOLD_PX,
+): { reference: PolygonSegmentReference; snappedCoordinate: [number, number] } | null {
+  const targetPoint = map.project([coordinate[0], coordinate[1]]);
+  let bestMatch: { reference: PolygonSegmentReference; snappedCoordinate: [number, number] } | null = null;
+  let bestDistance = maxDistancePx;
+
+  getPolygonRings(feature).forEach(({ polygonIndex, ringIndex, ring }) => {
+    for (let segmentIndex = 0; segmentIndex < ring.length - 1; segmentIndex++) {
+      const start = ring[segmentIndex];
+      const end = ring[segmentIndex + 1];
+      const startProjected = map.project([start[0], start[1]]);
+      const endProjected = map.project([end[0], end[1]]);
+      const segmentDx = endProjected.x - startProjected.x;
+      const segmentDy = endProjected.y - startProjected.y;
+      const segmentLengthSquared = segmentDx * segmentDx + segmentDy * segmentDy;
+      if (segmentLengthSquared === 0) {
+        continue;
+      }
+
+      const projectionRatio =
+        ((targetPoint.x - startProjected.x) * segmentDx + (targetPoint.y - startProjected.y) * segmentDy) /
+        segmentLengthSquared;
+      const t = Math.max(0, Math.min(1, projectionRatio));
+      const snappedX = startProjected.x + segmentDx * t;
+      const snappedY = startProjected.y + segmentDy * t;
+      const dx = snappedX - targetPoint.x;
+      const dy = snappedY - targetPoint.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      if (distance <= bestDistance) {
+        bestDistance = distance;
+        const snappedLngLat = map.unproject([snappedX, snappedY]);
+        bestMatch = {
+          reference: {
+            polygonIndex,
+            ringIndex,
+            segmentIndex,
+          },
+          snappedCoordinate: [snappedLngLat.lng, snappedLngLat.lat],
+        };
+      }
+    }
+  });
+
+  return bestMatch;
+}
+
+function insertPolygonVertexOnSegment(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  reference: PolygonSegmentReference,
+  coordinate: [number, number],
+): Feature<Polygon | MultiPolygon, GeoJsonProperties> {
+  if (feature.geometry.type === 'Polygon') {
+    const nextCoordinates = feature.geometry.coordinates.map((ring) => ring.map(([lng, lat]) => [lng, lat]));
+    const ring = nextCoordinates[reference.ringIndex];
+    if (!ring) {
+      return feature;
+    }
+
+    ring.splice(reference.segmentIndex + 1, 0, [coordinate[0], coordinate[1]]);
+    return {
+      ...feature,
+      geometry: {
+        ...feature.geometry,
+        coordinates: nextCoordinates,
+      },
+    };
+  }
+
+  const nextCoordinates = feature.geometry.coordinates.map((polygon) =>
+    polygon.map((ring) => ring.map(([lng, lat]) => [lng, lat])),
+  );
+  const ring = nextCoordinates[reference.polygonIndex]?.[reference.ringIndex];
+  if (!ring) {
+    return feature;
+  }
+
+  ring.splice(reference.segmentIndex + 1, 0, [coordinate[0], coordinate[1]]);
+  return {
+    ...feature,
+    geometry: {
+      ...feature.geometry,
+      coordinates: nextCoordinates,
+    },
+  };
+}
+
+function removePolygonVertex(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  reference: PolygonVertexReference,
+): Feature<Polygon | MultiPolygon, GeoJsonProperties> {
+  if (feature.geometry.type === 'Polygon') {
+    const nextCoordinates = feature.geometry.coordinates.map((ring) => ring.map(([lng, lat]) => [lng, lat]));
+    const ring = nextCoordinates[reference.ringIndex];
+    if (!ring) {
+      return feature;
+    }
+
+    const uniqueVertices = ring.slice(0, -1);
+    if (uniqueVertices.length <= 3 || reference.coordIndex >= uniqueVertices.length) {
+      return feature;
+    }
+
+    uniqueVertices.splice(reference.coordIndex, 1);
+    if (uniqueVertices.length < 3) {
+      return feature;
+    }
+
+    nextCoordinates[reference.ringIndex] = [...uniqueVertices, [...uniqueVertices[0]]];
+    return {
+      ...feature,
+      geometry: {
+        ...feature.geometry,
+        coordinates: nextCoordinates,
+      },
+    };
+  }
+
+  const nextCoordinates = feature.geometry.coordinates.map((polygon) =>
+    polygon.map((ring) => ring.map(([lng, lat]) => [lng, lat])),
+  );
+  const ring = nextCoordinates[reference.polygonIndex]?.[reference.ringIndex];
+  if (!ring) {
+    return feature;
+  }
+
+  const uniqueVertices = ring.slice(0, -1);
+  if (uniqueVertices.length <= 3 || reference.coordIndex >= uniqueVertices.length) {
+    return feature;
+  }
+
+  uniqueVertices.splice(reference.coordIndex, 1);
+  if (uniqueVertices.length < 3) {
+    return feature;
+  }
+
+  nextCoordinates[reference.polygonIndex][reference.ringIndex] = [...uniqueVertices, [...uniqueVertices[0]]];
+  return {
+    ...feature,
+    geometry: {
+      ...feature.geometry,
+      coordinates: nextCoordinates,
+    },
+  };
+}
+
+function snapCoordinateToNearbyGeometry(
+  map: Map,
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  coordinate: [number, number],
+  movingReference: PolygonVertexReference,
+): PolygonSnapResult {
+  const targetPoint = map.project([coordinate[0], coordinate[1]]);
+  let bestCoordinate: [number, number] = coordinate;
+  let bestDistance = POLYGON_EDIT_SNAP_THRESHOLD_PX;
+  let snapKind: PolygonSnapResult['kind'] = 'none';
+  let snapSegment: [[number, number], [number, number]] | undefined;
+
+  getPolygonRings(feature).forEach(({ polygonIndex, ringIndex, ring }) => {
+    if (ring.length < 2) {
+      return;
+    }
+
+    const uniqueVertexCount = Math.max(0, ring.length - 1);
+    for (let coordIndex = 0; coordIndex < uniqueVertexCount; coordIndex++) {
+      if (
+        polygonIndex === movingReference.polygonIndex &&
+        ringIndex === movingReference.ringIndex &&
+        coordIndex === movingReference.coordIndex
+      ) {
+        continue;
+      }
+
+      const vertex = ring[coordIndex];
+      const projected = map.project([vertex[0], vertex[1]]);
+      const dx = projected.x - targetPoint.x;
+      const dy = projected.y - targetPoint.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      if (distance <= bestDistance) {
+        bestDistance = distance;
+        bestCoordinate = [vertex[0], vertex[1]];
+        snapKind = 'vertex';
+        snapSegment = undefined;
+      }
+    }
+
+    for (let segmentIndex = 0; segmentIndex < ring.length - 1; segmentIndex++) {
+      // Do not snap against the segments directly adjacent to the vertex being moved.
+      if (polygonIndex === movingReference.polygonIndex && ringIndex === movingReference.ringIndex) {
+        const uniqueVertexCount = Math.max(0, ring.length - 1);
+        const previousSegmentIndex =
+          movingReference.coordIndex === 0 ? Math.max(0, uniqueVertexCount - 1) : movingReference.coordIndex - 1;
+        const nextSegmentIndex = movingReference.coordIndex;
+        if (segmentIndex === previousSegmentIndex || segmentIndex === nextSegmentIndex) {
+          continue;
+        }
+      }
+
+      const start = ring[segmentIndex];
+      const end = ring[segmentIndex + 1];
+      const startProjected = map.project([start[0], start[1]]);
+      const endProjected = map.project([end[0], end[1]]);
+      const segmentDx = endProjected.x - startProjected.x;
+      const segmentDy = endProjected.y - startProjected.y;
+      const segmentLengthSquared = segmentDx * segmentDx + segmentDy * segmentDy;
+      if (segmentLengthSquared === 0) {
+        continue;
+      }
+
+      const projectionRatio =
+        ((targetPoint.x - startProjected.x) * segmentDx + (targetPoint.y - startProjected.y) * segmentDy) /
+        segmentLengthSquared;
+      const t = Math.max(0, Math.min(1, projectionRatio));
+      const snappedX = startProjected.x + segmentDx * t;
+      const snappedY = startProjected.y + segmentDy * t;
+      const edgeDx = snappedX - targetPoint.x;
+      const edgeDy = snappedY - targetPoint.y;
+      const edgeDistance = Math.sqrt(edgeDx * edgeDx + edgeDy * edgeDy);
+
+      if (edgeDistance <= bestDistance) {
+        bestDistance = edgeDistance;
+        const snappedLngLat = map.unproject([snappedX, snappedY]);
+        bestCoordinate = [snappedLngLat.lng, snappedLngLat.lat];
+        snapKind = 'edge';
+        snapSegment = [
+          [start[0], start[1]],
+          [end[0], end[1]],
+        ];
+      }
+    }
+  });
+
+  return {
+    coordinate: bestCoordinate,
+    kind: snapKind,
+    segment: snapSegment,
+  };
+}
 
 function getPolygonGeometryBounds(geometry: Polygon | MultiPolygon): [number, number, number, number] {
   let minLon = Number.POSITIVE_INFINITY;
@@ -403,6 +833,16 @@ type SmoothPanelState = {
   sensitivity: number;
   x: number;
   y: number;
+};
+
+type PolygonGeometryEditState = {
+  open: boolean;
+  appFeatureId: string | null;
+  draftFeature: Feature<Polygon | MultiPolygon, GeoJsonProperties> | null;
+  draggingVertexId: string | null;
+  snapCoordinate: [number, number] | null;
+  snapSegment: [[number, number], [number, number]] | null;
+  snapKind: 'none' | 'vertex' | 'edge';
 };
 
 type WorkspaceSnapshot = {
@@ -778,6 +1218,7 @@ export default function App() {
   const [polygonNames, setPolygonNames] = useState<Record<string, string>>({});
   const [editingPolygonId, setEditingPolygonId] = useState<string | null>(null);
   const [editingPolygonNameDraft, setEditingPolygonNameDraft] = useState<string>('');
+  const [savingPolygonEditId, setSavingPolygonEditId] = useState<string | null>(null);
   const [mergeMode, setMergeMode] = useState<boolean>(false);
   const [selectedForMerge, setSelectedForMerge] = useState<Set<string>>(new Set());
   const [selectedFeatureId, setSelectedFeatureId] = useState<string | null>(null);
@@ -790,6 +1231,15 @@ export default function App() {
     sensitivity: 40,
     x: 0,
     y: 0,
+  });
+  const [polygonGeometryEdit, setPolygonGeometryEdit] = useState<PolygonGeometryEditState>({
+    open: false,
+    appFeatureId: null,
+    draftFeature: null,
+    draggingVertexId: null,
+    snapCoordinate: null,
+    snapSegment: null,
+    snapKind: 'none',
   });
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     open: false,
@@ -809,6 +1259,9 @@ export default function App() {
   const uploadDragDepthRef = useRef<number>(0);
   const polygonColorByIdRef = useRef<Record<string, string>>({});
   const hasRestoredWorkspaceRef = useRef<boolean>(false);
+  const polygonGeometryEditRef = useRef<PolygonGeometryEditState>(polygonGeometryEdit);
+  const draggingVertexRef = useRef<PolygonVertexReference | null>(null);
+  const suppressNextMapClickRef = useRef<boolean>(false);
 
   function createWorkspaceSnapshot(): WorkspaceSnapshot {
     return {
@@ -831,6 +1284,7 @@ export default function App() {
     closeContextMenu();
     closePolygonMenu();
     closeSmoothPanel();
+    closePolygonGeometryEdit();
     setError('');
 
     const map = mapRef.current;
@@ -936,6 +1390,76 @@ export default function App() {
     csvSource?.setData(getClassifiedCsvPointData(csvData, boundaryIndex));
   }
 
+  function syncPolygonGeometryEditSources(editState: PolygonGeometryEditState = polygonGeometryEditRef.current) {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const outlineSource = map.getSource(POLYGON_EDIT_OUTLINE_SOURCE_ID) as GeoJSONSource | undefined;
+    const verticesSource = map.getSource(POLYGON_EDIT_VERTICES_SOURCE_ID) as GeoJSONSource | undefined;
+    const snapPointSource = map.getSource(POLYGON_EDIT_SNAP_POINT_SOURCE_ID) as GeoJSONSource | undefined;
+    const snapSegmentSource = map.getSource(POLYGON_EDIT_SNAP_SEGMENT_SOURCE_ID) as GeoJSONSource | undefined;
+    if (!outlineSource || !verticesSource || !snapPointSource || !snapSegmentSource) {
+      return;
+    }
+
+    if (!editState.open || !editState.draftFeature) {
+      outlineSource.setData(EMPTY_COLLECTION);
+      verticesSource.setData(EMPTY_COLLECTION);
+      snapPointSource.setData(EMPTY_COLLECTION);
+      snapSegmentSource.setData(EMPTY_COLLECTION);
+      return;
+    }
+
+    outlineSource.setData({
+      type: 'FeatureCollection',
+      features: [editState.draftFeature],
+    });
+    verticesSource.setData(buildPolygonVertexCollection(editState.draftFeature));
+
+    if (editState.snapCoordinate) {
+      snapPointSource.setData({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            geometry: {
+              type: 'Point',
+              coordinates: [editState.snapCoordinate[0], editState.snapCoordinate[1]],
+            },
+            properties: {
+              kind: editState.snapKind,
+            },
+          },
+        ],
+      });
+    } else {
+      snapPointSource.setData(EMPTY_COLLECTION);
+    }
+
+    if (editState.snapSegment) {
+      snapSegmentSource.setData({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            geometry: {
+              type: 'LineString',
+              coordinates: [
+                [editState.snapSegment[0][0], editState.snapSegment[0][1]],
+                [editState.snapSegment[1][0], editState.snapSegment[1][1]],
+              ],
+            },
+            properties: {},
+          },
+        ],
+      });
+    } else {
+      snapSegmentSource.setData(EMPTY_COLLECTION);
+    }
+  }
+
   function syncGeoJsonSource(data: AnyFeatureCollection) {
     const map = mapRef.current;
     if (!map) {
@@ -946,6 +1470,141 @@ export default function App() {
     geoJsonSource?.setData(withPolygonColors(data, buildPolygonColorById(data)));
   }
 
+  function closePolygonGeometryEdit() {
+    draggingVertexRef.current = null;
+    mapRef.current?.dragPan.enable();
+    setPolygonGeometryEdit({
+      open: false,
+      appFeatureId: null,
+      draftFeature: null,
+      draggingVertexId: null,
+      snapCoordinate: null,
+      snapSegment: null,
+      snapKind: 'none',
+    });
+  }
+
+  function startPolygonGeometryEdit(appFeatureId: string) {
+    const targetFeature = displayData.features.find(
+      (feature) => feature.properties?.appFeatureId === appFeatureId,
+    ) as Feature<Geometry, GeoJsonProperties> | undefined;
+
+    if (!targetFeature || !isPolygonFeature(targetFeature)) {
+      return;
+    }
+
+    const polygonFeature = clonePolygonFeatureGeometry(
+      targetFeature as Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+    );
+
+    draggingVertexRef.current = null;
+    setPolygonGeometryEdit({
+      open: true,
+      appFeatureId,
+      draftFeature: polygonFeature,
+      draggingVertexId: null,
+      snapCoordinate: null,
+      snapSegment: null,
+      snapKind: 'none',
+    });
+    closeSmoothPanel();
+    closeContextMenu();
+  }
+
+  function startPolygonEditSession(appFeatureId: string) {
+    setCollapsedPolygonIds((previous) => {
+      if (!previous.has(appFeatureId)) {
+        return previous;
+      }
+
+      const next = new Set(previous);
+      next.delete(appFeatureId);
+      return next;
+    });
+
+    setEditingPolygonId(appFeatureId);
+    setEditingPolygonNameDraft(polygonNameById[appFeatureId] || '');
+    startPolygonGeometryEdit(appFeatureId);
+  }
+
+  async function savePolygonEditSession(appFeatureId: string) {
+    if (savingPolygonEditId === appFeatureId) {
+      return;
+    }
+
+    setSavingPolygonEditId(appFeatureId);
+    setOperationAlert(null);
+    await waitForUiPaint();
+
+    const nextName = editingPolygonNameDraft.trim() || polygonNameById[appFeatureId] || 'Polygon';
+    const geometryEditState = polygonGeometryEditRef.current;
+    const hasGeometryDraft =
+      geometryEditState.open &&
+      geometryEditState.appFeatureId === appFeatureId &&
+      geometryEditState.draftFeature;
+
+    try {
+      if (!hasGeometryDraft) {
+        handlePolygonNameChange(appFeatureId, nextName);
+        setEditingPolygonId(null);
+        setEditingPolygonNameDraft('');
+        setError('');
+        setOperationAlert({
+          type: 'success',
+          message: 'Polygon edits saved.',
+        });
+        return;
+      }
+
+      const draftFeature = geometryEditState.draftFeature as Feature<Polygon | MultiPolygon, GeoJsonProperties>;
+
+      recordHistorySnapshot();
+      const newDisplayData: AnyFeatureCollection = {
+        type: 'FeatureCollection',
+        features: displayDataRef.current.features.map((feature) =>
+          feature.properties?.appFeatureId === appFeatureId
+            ? ({
+                ...draftFeature,
+                properties: {
+                  ...feature.properties,
+                  ...draftFeature.properties,
+                },
+              } as Feature<Geometry, GeoJsonProperties>)
+            : feature,
+        ),
+      };
+
+      setDisplayData(newDisplayData);
+      setPolygonNames((previous) => ({
+        ...previous,
+        [appFeatureId]: nextName,
+      }));
+      syncGeoJsonSource(newDisplayData);
+      syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
+      closePolygonGeometryEdit();
+      setEditingPolygonId(null);
+      setEditingPolygonNameDraft('');
+      setError('');
+      setOperationAlert({
+        type: 'success',
+        message: 'Polygon edits saved.',
+      });
+    } finally {
+      setSavingPolygonEditId(null);
+    }
+  }
+
+  function cancelPolygonEditSession(appFeatureId: string) {
+    if (editingPolygonId === appFeatureId) {
+      setEditingPolygonId(null);
+      setEditingPolygonNameDraft('');
+    }
+
+    if (polygonGeometryEditRef.current.open && polygonGeometryEditRef.current.appFeatureId === appFeatureId) {
+      closePolygonGeometryEdit();
+    }
+  }
+
   useEffect(() => {
     displayDataRef.current = displayData;
   }, [displayData]);
@@ -953,6 +1612,10 @@ export default function App() {
   useEffect(() => {
     csvPointDataRef.current = csvPointData;
   }, [csvPointData]);
+
+  useEffect(() => {
+    polygonGeometryEditRef.current = polygonGeometryEdit;
+  }, [polygonGeometryEdit]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -1004,6 +1667,15 @@ export default function App() {
 
     void savePersistedWorkspaceSnapshot(snapshot).catch(() => undefined);
   }, [displayData, csvPointData, csvPointFiles, uploadedFiles, polygonNames]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isMapStyleReady) {
+      return;
+    }
+
+    syncPolygonGeometryEditSources(polygonGeometryEdit);
+  }, [isMapStyleReady, polygonGeometryEdit]);
 
   const polygonColorById = useMemo(() => buildPolygonColorById(displayData), [displayData]);
 
@@ -1202,6 +1874,19 @@ export default function App() {
   }, [editingPolygonId, polygonItems]);
 
   useEffect(() => {
+    if (!polygonGeometryEdit.open || !polygonGeometryEdit.appFeatureId) {
+      return;
+    }
+
+    const exists = displayData.features.some(
+      (feature) => feature.properties?.appFeatureId === polygonGeometryEdit.appFeatureId,
+    );
+    if (!exists) {
+      closePolygonGeometryEdit();
+    }
+  }, [displayData, polygonGeometryEdit.appFeatureId, polygonGeometryEdit.open]);
+
+  useEffect(() => {
     setCollapsedPolygonIds((previous) => {
       const validIds = new Set(polygonItems.map((item) => item.appFeatureId));
       const next = new Set<string>();
@@ -1374,6 +2059,34 @@ export default function App() {
       });
     }
 
+    if (!map.getSource(POLYGON_EDIT_OUTLINE_SOURCE_ID)) {
+      map.addSource(POLYGON_EDIT_OUTLINE_SOURCE_ID, {
+        type: 'geojson',
+        data: EMPTY_COLLECTION,
+      });
+    }
+
+    if (!map.getSource(POLYGON_EDIT_VERTICES_SOURCE_ID)) {
+      map.addSource(POLYGON_EDIT_VERTICES_SOURCE_ID, {
+        type: 'geojson',
+        data: EMPTY_COLLECTION,
+      });
+    }
+
+    if (!map.getSource(POLYGON_EDIT_SNAP_POINT_SOURCE_ID)) {
+      map.addSource(POLYGON_EDIT_SNAP_POINT_SOURCE_ID, {
+        type: 'geojson',
+        data: EMPTY_COLLECTION,
+      });
+    }
+
+    if (!map.getSource(POLYGON_EDIT_SNAP_SEGMENT_SOURCE_ID)) {
+      map.addSource(POLYGON_EDIT_SNAP_SEGMENT_SOURCE_ID, {
+        type: 'geojson',
+        data: EMPTY_COLLECTION,
+      });
+    }
+
     if (!map.getLayer('geojson-fill')) {
       map.addLayer({
         id: 'geojson-fill',
@@ -1423,6 +2136,66 @@ export default function App() {
             3.2,
             2,
           ],
+        },
+      });
+    }
+
+    if (!map.getLayer(POLYGON_EDIT_OUTLINE_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_EDIT_OUTLINE_LAYER_ID,
+        type: 'line',
+        source: POLYGON_EDIT_OUTLINE_SOURCE_ID,
+        paint: {
+          'line-color': '#f59e0b',
+          'line-width': 2.5,
+          'line-dasharray': [2, 2],
+        },
+      });
+    }
+
+    if (!map.getLayer(POLYGON_EDIT_VERTICES_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_EDIT_VERTICES_LAYER_ID,
+        type: 'circle',
+        source: POLYGON_EDIT_VERTICES_SOURCE_ID,
+        paint: {
+          'circle-radius': 4.5,
+          'circle-color': '#f97316',
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffffff',
+        },
+      });
+    }
+
+    if (!map.getLayer(POLYGON_EDIT_SNAP_SEGMENT_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_EDIT_SNAP_SEGMENT_LAYER_ID,
+        type: 'line',
+        source: POLYGON_EDIT_SNAP_SEGMENT_SOURCE_ID,
+        paint: {
+          'line-color': '#06b6d4',
+          'line-width': 3,
+          'line-opacity': 0.8,
+          'line-dasharray': [1, 1],
+        },
+      });
+    }
+
+    if (!map.getLayer(POLYGON_EDIT_SNAP_POINT_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_EDIT_SNAP_POINT_LAYER_ID,
+        type: 'circle',
+        source: POLYGON_EDIT_SNAP_POINT_SOURCE_ID,
+        paint: {
+          'circle-radius': 6,
+          'circle-color': [
+            'case',
+            ['==', ['get', 'kind'], 'vertex'],
+            '#2563eb',
+            '#06b6d4',
+          ],
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffffff',
         },
       });
     }
@@ -1512,6 +2285,7 @@ export default function App() {
     dataSource?.setData(withPolygonColors(displayDataRef.current, polygonColorByIdRef.current));
     const csvPointSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
     csvPointSource?.setData(getClassifiedCsvPointData(csvPointDataRef.current, buildPolygonBoundaryIndex(displayDataRef.current)));
+    syncPolygonGeometryEditSources();
     clearHoveredFeature(map);
 
     if (selectedFeatureIdRef.current) {
@@ -1594,7 +2368,145 @@ export default function App() {
       map.getCanvas().style.cursor = '';
     });
 
+    const finishVertexDrag = () => {
+      draggingVertexRef.current = null;
+      map.dragPan.enable();
+      setPolygonGeometryEdit((previous) => ({
+        ...previous,
+        draggingVertexId: null,
+        snapCoordinate: null,
+        snapSegment: null,
+        snapKind: 'none',
+      }));
+    };
+
+    map.on('mousedown', (event) => {
+      if (!polygonGeometryEditRef.current.open || !polygonGeometryEditRef.current.draftFeature) {
+        return;
+      }
+
+      const nearestVertex = findNearestVertexForCoordinate(
+        map,
+        polygonGeometryEditRef.current.draftFeature,
+        [event.lngLat.lng, event.lngLat.lat],
+        16,
+      );
+      if (!nearestVertex) {
+        return;
+      }
+
+      const nextReference = nearestVertex.reference;
+
+      event.preventDefault();
+      event.originalEvent.stopPropagation();
+      suppressNextMapClickRef.current = true;
+
+      const mouseEvent = event.originalEvent as MouseEvent;
+      if (mouseEvent.shiftKey) {
+        setPolygonGeometryEdit((previous) => {
+          if (!previous.draftFeature) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            draftFeature: removePolygonVertex(previous.draftFeature, nextReference),
+            draggingVertexId: null,
+            snapCoordinate: null,
+            snapSegment: null,
+            snapKind: 'none',
+          };
+        });
+        return;
+      }
+
+      draggingVertexRef.current = nextReference;
+      map.dragPan.disable();
+
+      setPolygonGeometryEdit((previous) => ({
+        ...previous,
+        draggingVertexId: nearestVertex.vertexId,
+      }));
+    });
+
+    map.on('click', POLYGON_EDIT_OUTLINE_LAYER_ID, (event) => {
+      if (!polygonGeometryEditRef.current.open || !polygonGeometryEditRef.current.draftFeature) {
+        return;
+      }
+
+      suppressNextMapClickRef.current = true;
+
+      const nearestSegment = findNearestSegmentForCoordinate(
+        map,
+        polygonGeometryEditRef.current.draftFeature,
+        [event.lngLat.lng, event.lngLat.lat],
+        POLYGON_EDIT_SNAP_THRESHOLD_PX + 4,
+      );
+      if (!nearestSegment) {
+        return;
+      }
+
+      setPolygonGeometryEdit((previous) => {
+        if (!previous.draftFeature) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          draftFeature: insertPolygonVertexOnSegment(
+            previous.draftFeature,
+            nearestSegment.reference,
+            nearestSegment.snappedCoordinate,
+          ),
+          snapCoordinate: nearestSegment.snappedCoordinate,
+          snapSegment: null,
+          snapKind: 'vertex',
+        };
+      });
+    });
+
+    map.on('mouseenter', POLYGON_EDIT_OUTLINE_LAYER_ID, () => {
+      if (!draggingVertexRef.current && polygonGeometryEditRef.current.open) {
+        map.getCanvas().style.cursor = 'copy';
+      }
+    });
+
+    map.on('mouseleave', POLYGON_EDIT_OUTLINE_LAYER_ID, () => {
+      if (!draggingVertexRef.current) {
+        map.getCanvas().style.cursor = '';
+      }
+    });
+
+    map.on('mouseenter', POLYGON_EDIT_VERTICES_LAYER_ID, () => {
+      map.getCanvas().style.cursor = draggingVertexRef.current ? 'grabbing' : 'grab';
+    });
+
+    map.on('mouseleave', POLYGON_EDIT_VERTICES_LAYER_ID, () => {
+      if (!draggingVertexRef.current) {
+        map.getCanvas().style.cursor = '';
+      }
+    });
+
+    map.on('mouseup', () => {
+      if (draggingVertexRef.current) {
+        finishVertexDrag();
+      }
+    });
+
     map.on('click', (event) => {
+      if (draggingVertexRef.current) {
+        return;
+      }
+
+      if (suppressNextMapClickRef.current) {
+        suppressNextMapClickRef.current = false;
+        return;
+      }
+
+      if (polygonGeometryEditRef.current.open) {
+        return;
+      }
+
       if (!map.getLayer('geojson-fill')) {
         closeContextMenu();
         return;
@@ -1629,6 +2541,44 @@ export default function App() {
     });
 
     map.on('mousemove', (event) => {
+      if (draggingVertexRef.current && polygonGeometryEditRef.current.draftFeature) {
+        const activeDragReference = draggingVertexRef.current;
+        const isSnapSuppressed = (event.originalEvent as MouseEvent).altKey;
+        const snapResult = isSnapSuppressed
+          ? {
+              coordinate: [event.lngLat.lng, event.lngLat.lat] as [number, number],
+              kind: 'none' as const,
+              segment: undefined,
+            }
+          : snapCoordinateToNearbyGeometry(
+              map,
+              polygonGeometryEditRef.current.draftFeature,
+              [event.lngLat.lng, event.lngLat.lat],
+              activeDragReference,
+            );
+
+        setPolygonGeometryEdit((previous) => {
+          if (!previous.draftFeature) {
+            return previous;
+          }
+
+          if (!activeDragReference) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            draftFeature: updatePolygonVertexCoordinate(previous.draftFeature, activeDragReference, snapResult.coordinate),
+            snapCoordinate: snapResult.kind === 'none' ? null : snapResult.coordinate,
+            snapSegment: snapResult.segment ?? null,
+            snapKind: snapResult.kind,
+          };
+        });
+
+        map.getCanvas().style.cursor = 'grabbing';
+        return;
+      }
+
       if (!map.getLayer('geojson-fill')) {
         map.getCanvas().style.cursor = '';
         return;
@@ -1650,6 +2600,7 @@ export default function App() {
     mapRef.current = map;
 
     return () => {
+      finishVertexDrag();
       setIsMapStyleReady(false);
       clearHoveredFeature(map);
       clearSelectedFeature(map);
@@ -2007,6 +2958,14 @@ export default function App() {
   }
 
   function handleRemoveFile(fileId: string) {
+    const wasEditingRemovedFile =
+      polygonGeometryEditRef.current.open &&
+      displayDataRef.current.features.some(
+        (feature) =>
+          feature.properties?.appFeatureId === polygonGeometryEditRef.current.appFeatureId &&
+          feature.properties?.sourceFileId === fileId,
+      );
+
     const removedIds = new Set(
       displayData.features
         .filter((feature) => feature.properties?.sourceFileId === fileId)
@@ -2027,6 +2986,10 @@ export default function App() {
     const map = mapRef.current;
     if (map && selectedFeatureIdRef.current && removedIds.has(selectedFeatureIdRef.current)) {
       clearSelectedFeature(map);
+    }
+
+    if (wasEditingRemovedFile) {
+      closePolygonGeometryEdit();
     }
 
     closeContextMenu();
@@ -2052,6 +3015,7 @@ export default function App() {
     }
 
     closeContextMenu();
+    closePolygonGeometryEdit();
 
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -2412,6 +3376,9 @@ export default function App() {
     if (smoothPanel.appFeatureId === appFeatureId) {
       closeSmoothPanel();
     }
+    if (polygonGeometryEditRef.current.appFeatureId === appFeatureId) {
+      closePolygonGeometryEdit();
+    }
     closeContextMenu();
   }
 
@@ -2445,31 +3412,6 @@ export default function App() {
       ...previous,
       [appFeatureId]: name,
     }));
-  }
-
-  function startPolygonNameEdit(appFeatureId: string) {
-    setCollapsedPolygonIds((previous) => {
-      if (!previous.has(appFeatureId)) {
-        return previous;
-      }
-
-      const next = new Set(previous);
-      next.delete(appFeatureId);
-      return next;
-    });
-    setEditingPolygonId(appFeatureId);
-    setEditingPolygonNameDraft(polygonNameById[appFeatureId] || '');
-  }
-
-  function cancelPolygonNameEdit() {
-    setEditingPolygonId(null);
-    setEditingPolygonNameDraft('');
-  }
-
-  function savePolygonNameEdit(appFeatureId: string) {
-    handlePolygonNameChange(appFeatureId, editingPolygonNameDraft);
-    setEditingPolygonId(null);
-    setEditingPolygonNameDraft('');
   }
 
   function handleExportPolygon(appFeatureId: string) {
@@ -2846,6 +3788,8 @@ export default function App() {
                         const isChecked = selectedForMerge.has(item.appFeatureId);
                         const isSelected = !mergeMode && selectedFeatureId === item.appFeatureId;
                         const isSplitBusy = splittingFeatureIds.has(item.appFeatureId);
+                        const isGeometryEditActive =
+                          polygonGeometryEdit.open && polygonGeometryEdit.appFeatureId === item.appFeatureId;
                         const isCollapsed = collapsedPolygonIds.has(item.appFeatureId);
                         const metrics = polygonMetricsById[item.appFeatureId] || { vertices: 0, edges: 0 };
                         const polygonColor = isSelected
@@ -2889,14 +3833,14 @@ export default function App() {
                                 <p className="truncate text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                                   Polygon {index + 1}
                                 </p>
-                                {editingPolygonId !== item.appFeatureId ? (
+                                {!isGeometryEditActive ? (
                                   <button
                                     onClick={(event) => {
                                       event.stopPropagation();
-                                      startPolygonNameEdit(item.appFeatureId);
+                                      startPolygonEditSession(item.appFeatureId);
                                     }}
-                                    title="Edit polygon name"
-                                    aria-label="Edit polygon name"
+                                    title="Edit vertices"
+                                    aria-label="Edit polygon vertices"
                                     className="inline-flex p-1 items-center justify-center rounded-md text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
                                   >
                                     <Pencil className="h-3 w-3" />
@@ -2977,6 +3921,11 @@ export default function App() {
                                 transition={{ duration: 0.2, ease: 'easeInOut' }}
                                 className="overflow-hidden"
                               >
+                              {isGeometryEditActive ? (
+                                <p className="mt-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-700">
+                                  Drag vertices to move, click edges to insert vertices, and Shift-click a vertex to delete. Snapping guides are enabled.
+                                </p>
+                              ) : null}
                               <div className="mt-1 flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
                                 {editingPolygonId === item.appFeatureId ? (
                                   <>
@@ -2990,22 +3939,28 @@ export default function App() {
                                     <button
                                       onClick={(event) => {
                                         event.stopPropagation();
-                                        savePolygonNameEdit(item.appFeatureId);
+                                        void savePolygonEditSession(item.appFeatureId);
                                       }}
-                                      title="Save name"
-                                      aria-label="Save name"
-                                      className="inline-flex p-2 items-center justify-center rounded-md bg-emerald-600 text-white transition hover:bg-emerald-500"
+                                      title={savingPolygonEditId === item.appFeatureId ? 'Saving edits' : 'Save edits'}
+                                      aria-label={savingPolygonEditId === item.appFeatureId ? 'Saving edits' : 'Save edits'}
+                                      disabled={savingPolygonEditId === item.appFeatureId}
+                                      className="inline-flex p-2 items-center justify-center rounded-md bg-emerald-600 text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-emerald-400"
                                     >
-                                      <Check className="h-4.5 w-4.5" />
+                                      {savingPolygonEditId === item.appFeatureId ? (
+                                        <Loader2 className="h-4.5 w-4.5 animate-spin" />
+                                      ) : (
+                                        <Check className="h-4.5 w-4.5" />
+                                      )}
                                     </button>
                                     <button
                                       onClick={(event) => {
                                         event.stopPropagation();
-                                        cancelPolygonNameEdit();
+                                        cancelPolygonEditSession(item.appFeatureId);
                                       }}
                                       title="Cancel rename"
                                       aria-label="Cancel rename"
-                                      className="inline-flex p-2 items-center justify-center rounded-md border border-slate-300 text-slate-700 transition hover:bg-slate-50"
+                                      disabled={savingPolygonEditId === item.appFeatureId}
+                                      className="inline-flex p-2 items-center justify-center rounded-md border border-slate-300 text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                                     >
                                       <X className="h-4.5 w-4.5" />
                                     </button>
