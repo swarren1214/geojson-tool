@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map } from 'maplibre-gl';
 import { AnimatePresence, motion } from 'framer-motion';
+import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
 import type { Feature, GeoJsonProperties, Geometry, MultiPolygon, Point, Polygon } from 'geojson';
 import {
   Braces,
@@ -44,6 +45,117 @@ const BASEMAP_STYLE = 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.j
 const POLYGON_FILL_COLOR = '#2a9d8f';
 const POLYGON_SELECTED_FILL_COLOR = '#f59e0b';
 const POLYGON_HOVER_FILL_COLOR = '#0f172a';
+const CSV_INSIDE_COLOR = '#16a34a';
+const CSV_OUTSIDE_COLOR = '#dc2626';
+const CSV_MIXED_CLUSTER_COLOR = '#facc15';
+
+type PolygonBoundaryIndexItem = {
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>;
+  minLon: number;
+  minLat: number;
+  maxLon: number;
+  maxLat: number;
+};
+
+function getPolygonGeometryBounds(geometry: Polygon | MultiPolygon): [number, number, number, number] {
+  let minLon = Number.POSITIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+
+  const rings = geometry.type === 'Polygon' ? geometry.coordinates : geometry.coordinates.flat();
+  rings.forEach((ring) => {
+    ring.forEach(([lon, lat]) => {
+      minLon = Math.min(minLon, lon);
+      minLat = Math.min(minLat, lat);
+      maxLon = Math.max(maxLon, lon);
+      maxLat = Math.max(maxLat, lat);
+    });
+  });
+
+  return [minLon, minLat, maxLon, maxLat];
+}
+
+function buildPolygonBoundaryIndex(data: AnyFeatureCollection): PolygonBoundaryIndexItem[] {
+  return data.features.flatMap((feature) => {
+    if (!isPolygonFeature(feature as Feature<Geometry, GeoJsonProperties>)) {
+      return [];
+    }
+
+    const polygonFeature = feature as Feature<Polygon | MultiPolygon, GeoJsonProperties>;
+    const [minLon, minLat, maxLon, maxLat] = getPolygonGeometryBounds(polygonFeature.geometry);
+
+    return [
+      {
+        feature: polygonFeature,
+        minLon,
+        minLat,
+        maxLon,
+        maxLat,
+      },
+    ];
+  });
+}
+
+function withCsvBoundaryStatus(
+  csvData: AnyFeatureCollection,
+  polygonBoundaryIndex: PolygonBoundaryIndexItem[],
+): AnyFeatureCollection {
+  if (!csvData.features.length) {
+    return csvData;
+  }
+
+  let changed = false;
+
+  const features = csvData.features.map((feature) => {
+    if (feature.geometry?.type !== 'Point') {
+      return feature;
+    }
+
+    const [lon, lat] = feature.geometry.coordinates;
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+      return feature;
+    }
+
+    const insideGeoJsonBoundary = polygonBoundaryIndex.some((boundary) => {
+      if (lon < boundary.minLon || lon > boundary.maxLon || lat < boundary.minLat || lat > boundary.maxLat) {
+        return false;
+      }
+
+      return booleanPointInPolygon(feature as Feature<Point, GeoJsonProperties>, boundary.feature);
+    });
+
+    const previousValue = feature.properties?.insideGeoJsonBoundary === true;
+    if (previousValue === insideGeoJsonBoundary) {
+      return feature;
+    }
+
+    changed = true;
+    return {
+      ...feature,
+      properties: {
+        ...feature.properties,
+        insideGeoJsonBoundary,
+      },
+    };
+  });
+
+  if (!changed) {
+    return csvData;
+  }
+
+  return {
+    ...csvData,
+    features,
+  };
+}
+
+function getClassifiedCsvPointData(
+  csvData: AnyFeatureCollection,
+  polygonBoundaryIndex: PolygonBoundaryIndexItem[],
+): AnyFeatureCollection {
+  return withCsvBoundaryStatus(csvData, polygonBoundaryIndex);
+}
 
 function getPolygonColorForId(appFeatureId: string): string {
   // Hash the feature id into a stable hue so each polygon keeps its own color.
@@ -560,7 +672,6 @@ function PolygonIconActionButton({
 export default function App() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const csvPointFileInputRef = useRef<HTMLInputElement | null>(null);
   const mapRef = useRef<Map | null>(null);
 
   const [displayData, setDisplayData] = useState<AnyFeatureCollection>(EMPTY_COLLECTION);
@@ -569,11 +680,11 @@ export default function App() {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFileMeta[]>([]);
   const [error, setError] = useState<string>('');
   const [isDragOverUpload, setIsDragOverUpload] = useState<boolean>(false);
-  const [isDragOverCsvUpload, setIsDragOverCsvUpload] = useState<boolean>(false);
   const [showStates, setShowStates] = useState<boolean>(false);
   const [isSplittingAll, setIsSplittingAll] = useState<boolean>(false);
   const [splittingFeatureIds, setSplittingFeatureIds] = useState<Set<string>>(new Set());
   const [operationAlert, setOperationAlert] = useState<OperationAlertState | null>(null);
+  const [isCsvLegendExpanded, setIsCsvLegendExpanded] = useState<boolean>(false);
   const [collapsedPolygonIds, setCollapsedPolygonIds] = useState<Set<string>>(new Set());
   const [polygonNames, setPolygonNames] = useState<Record<string, string>>({});
   const [editingPolygonId, setEditingPolygonId] = useState<string | null>(null);
@@ -607,7 +718,6 @@ export default function App() {
   const selectedFeatureIdRef = useRef<string | null>(null);
   const pendingFitBoundsRef = useRef<LngLatBoundsLike | null>(null);
   const uploadDragDepthRef = useRef<number>(0);
-  const csvUploadDragDepthRef = useRef<number>(0);
   const polygonColorByIdRef = useRef<Record<string, string>>({});
 
   function createWorkspaceSnapshot(): WorkspaceSnapshot {
@@ -721,6 +831,19 @@ export default function App() {
     if (bounds) {
       fitMapToBounds(bounds as LngLatBoundsLike);
     }
+  }
+
+  function syncCsvPointSource(
+    csvData: AnyFeatureCollection,
+    boundaryIndex: PolygonBoundaryIndexItem[] = polygonBoundaryIndex,
+  ) {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const csvSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
+    csvSource?.setData(getClassifiedCsvPointData(csvData, boundaryIndex));
   }
 
   useEffect(() => {
@@ -900,6 +1023,8 @@ export default function App() {
 
     return [...primaryGroups, ...fallbackGroups];
   }, [uploadedFiles, polygonItems]);
+
+  const polygonBoundaryIndex = useMemo(() => buildPolygonBoundaryIndex(displayData), [displayData]);
 
   useEffect(() => {
     setPolygonNames((previous) => {
@@ -1091,6 +1216,10 @@ export default function App() {
         cluster: true,
         clusterMaxZoom: 12,
         clusterRadius: 48,
+        clusterProperties: {
+          insideCount: ['+', ['case', ['boolean', ['get', 'insideGeoJsonBoundary'], false], 1, 0]],
+          outsideCount: ['+', ['case', ['boolean', ['get', 'insideGeoJsonBoundary'], false], 0, 1]],
+        },
       });
     }
 
@@ -1170,13 +1299,12 @@ export default function App() {
         filter: ['has', 'point_count'],
         paint: {
           'circle-color': [
-            'step',
-            ['get', 'point_count'],
-            '#f59e0b',
-            100,
-            '#f97316',
-            1000,
-            '#dc2626',
+            'case',
+            ['==', ['get', 'outsideCount'], 0],
+            CSV_INSIDE_COLOR,
+            ['==', ['get', 'insideCount'], 0],
+            CSV_OUTSIDE_COLOR,
+            CSV_MIXED_CLUSTER_COLOR,
           ],
           'circle-radius': [
             'step',
@@ -1219,7 +1347,7 @@ export default function App() {
         filter: ['!', ['has', 'point_count']],
         paint: {
           'circle-radius': 3.5,
-          'circle-color': '#dc2626',
+          'circle-color': ['case', ['boolean', ['get', 'insideGeoJsonBoundary'], false], CSV_INSIDE_COLOR, CSV_OUTSIDE_COLOR],
           'circle-stroke-color': '#ffffff',
           'circle-stroke-width': 1,
           'circle-opacity': 0.85,
@@ -1232,7 +1360,7 @@ export default function App() {
     const dataSource = map.getSource('geojson-data') as GeoJSONSource | undefined;
     dataSource?.setData(withPolygonColors(displayDataRef.current, polygonColorByIdRef.current));
     const csvPointSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
-    csvPointSource?.setData(csvPointDataRef.current);
+    csvPointSource?.setData(getClassifiedCsvPointData(csvPointDataRef.current, buildPolygonBoundaryIndex(displayDataRef.current)));
     clearHoveredFeature(map);
 
     if (selectedFeatureIdRef.current) {
@@ -1395,8 +1523,8 @@ export default function App() {
     }
 
     const source = map.getSource('csv-point-data') as GeoJSONSource | undefined;
-    source?.setData(csvPointData);
-  }, [csvPointData]);
+    source?.setData(getClassifiedCsvPointData(csvPointData, polygonBoundaryIndex));
+  }, [csvPointData, polygonBoundaryIndex]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1473,11 +1601,14 @@ export default function App() {
 
     if (importedFeatures.length > 0) {
       recordHistorySnapshot();
-      setDisplayData((previous) => ({
+      const newDisplayData: AnyFeatureCollection = {
         type: 'FeatureCollection',
-        features: [...previous.features, ...importedFeatures],
-      }));
+        features: [...displayDataRef.current.features, ...importedFeatures],
+      };
+      setDisplayData(newDisplayData);
       setUploadedFiles((previous) => [...previous, ...importedFiles]);
+
+      syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
 
       fitMapToCollection({
         type: 'FeatureCollection',
@@ -1498,7 +1629,59 @@ export default function App() {
 
   async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const selectedFiles = Array.from(event.target.files || []);
-    await importGeoJsonFiles(selectedFiles);
+    await handleMixedFileImport(selectedFiles);
+  }
+
+  async function handleMixedFileImport(selectedFiles: File[]) {
+    if (!selectedFiles.length) {
+      return;
+    }
+
+    const geoJsonFiles: File[] = [];
+    const csvFiles: File[] = [];
+    const unsupportedFiles: string[] = [];
+
+    selectedFiles.forEach((selectedFile) => {
+      const normalizedName = selectedFile.name.trim().toLowerCase();
+
+      if (normalizedName.endsWith('.csv')) {
+        csvFiles.push(selectedFile);
+        return;
+      }
+
+      if (normalizedName.endsWith('.geojson') || normalizedName.endsWith('.json')) {
+        geoJsonFiles.push(selectedFile);
+        return;
+      }
+
+      unsupportedFiles.push(selectedFile.name);
+    });
+
+    if (geoJsonFiles.length > 0) {
+      await importGeoJsonFiles(geoJsonFiles);
+    }
+
+    if (csvFiles.length > 0) {
+      await importCsvPointFiles(csvFiles);
+    }
+
+    if (unsupportedFiles.length > 0) {
+      const unsupportedMessage = `Unsupported file type${unsupportedFiles.length === 1 ? '' : 's'}: ${unsupportedFiles.join(', ')}`;
+
+      if (geoJsonFiles.length > 0 || csvFiles.length > 0) {
+        setError('');
+        setOperationAlert({
+          type: 'error',
+          message: unsupportedMessage,
+        });
+      } else {
+        setError(unsupportedMessage);
+      }
+    }
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
   }
 
   async function importCsvPointFiles(selectedFiles: File[]) {
@@ -1538,12 +1721,7 @@ export default function App() {
       };
       setCsvPointData(newCsvPointData);
       setCsvPointFiles((previous) => [...previous, ...importedCsvFiles]);
-
-      const map = mapRef.current;
-      if (map) {
-        const csvSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
-        csvSource?.setData(newCsvPointData);
-      }
+      syncCsvPointSource(newCsvPointData);
 
       fitMapToCollection({
         type: 'FeatureCollection',
@@ -1577,52 +1755,10 @@ export default function App() {
       }
     }
 
-    if (csvPointFileInputRef.current) {
-      csvPointFileInputRef.current.value = '';
-    }
   }
 
-  async function handleCsvPointFileChange(event: React.ChangeEvent<HTMLInputElement>) {
-    const selectedFiles = Array.from(event.target.files || []);
-    await importCsvPointFiles(selectedFiles);
-  }
-
-  function handleCsvPointUploadClick() {
-    csvPointFileInputRef.current?.click();
-  }
-
-  function handleCsvUploadDragEnter(event: React.DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    event.stopPropagation();
-    csvUploadDragDepthRef.current += 1;
-    setIsDragOverCsvUpload(true);
-  }
-
-  function handleCsvUploadDragOver(event: React.DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!isDragOverCsvUpload) {
-      setIsDragOverCsvUpload(true);
-    }
-  }
-
-  function handleCsvUploadDragLeave(event: React.DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    event.stopPropagation();
-    csvUploadDragDepthRef.current = Math.max(0, csvUploadDragDepthRef.current - 1);
-    if (csvUploadDragDepthRef.current === 0) {
-      setIsDragOverCsvUpload(false);
-    }
-  }
-
-  async function handleCsvUploadDrop(event: React.DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    event.stopPropagation();
-    csvUploadDragDepthRef.current = 0;
-    setIsDragOverCsvUpload(false);
-
-    const droppedFiles = Array.from(event.dataTransfer.files || []);
-    await importCsvPointFiles(droppedFiles);
+  function handleUploadDropZoneClick() {
+    fileInputRef.current?.click();
   }
 
   function handleRemoveCsvPointFile(csvFileId: string) {
@@ -1636,16 +1772,7 @@ export default function App() {
     };
     setCsvPointData(newCsvPointData);
     setCsvPointFiles((previous) => previous.filter((file) => file.id !== csvFileId));
-
-    const map = mapRef.current;
-    if (map) {
-      const csvSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
-      csvSource?.setData(newCsvPointData);
-    }
-  }
-
-  function handleUploadDropZoneClick() {
-    fileInputRef.current?.click();
+    syncCsvPointSource(newCsvPointData);
   }
 
   function handleUploadDragEnter(event: React.DragEvent<HTMLDivElement>) {
@@ -1679,7 +1806,7 @@ export default function App() {
     setIsDragOverUpload(false);
 
     const droppedFiles = Array.from(event.dataTransfer.files || []);
-    await importGeoJsonFiles(droppedFiles);
+    await handleMixedFileImport(droppedFiles);
   }
 
   function handleRemoveFile(fileId: string) {
@@ -1690,11 +1817,13 @@ export default function App() {
     );
 
     recordHistorySnapshot();
-    setDisplayData((previous) => ({
+    const newDisplayData: AnyFeatureCollection = {
       type: 'FeatureCollection',
-      features: previous.features.filter((feature) => feature.properties?.sourceFileId !== fileId),
-    }));
+      features: displayDataRef.current.features.filter((feature) => feature.properties?.sourceFileId !== fileId),
+    };
+    setDisplayData(newDisplayData);
     setUploadedFiles((previous) => previous.filter((file) => file.id !== fileId));
+    syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
     closePolygonMenu();
 
     const map = mapRef.current;
@@ -1728,14 +1857,8 @@ export default function App() {
       fileInputRef.current.value = '';
     }
 
-    if (csvPointFileInputRef.current) {
-      csvPointFileInputRef.current.value = '';
-    }
-
     setIsDragOverUpload(false);
-    setIsDragOverCsvUpload(false);
     uploadDragDepthRef.current = 0;
-    csvUploadDragDepthRef.current = 0;
   }
 
   function toggleMergeMode() {
@@ -2190,7 +2313,7 @@ export default function App() {
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white/85 p-4 shadow-sm">
           <label className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-600">
             <FileUp className="h-3.5 w-3.5" />
-            Upload GeoJSON Files
+            Upload Files
           </label>
           <div
             role="button"
@@ -2222,12 +2345,12 @@ export default function App() {
               </div>
               <div>
                 <p className={`text-sm font-semibold ${isDragOverUpload ? 'text-indigo-800' : 'text-slate-800'}`}>
-                  {isDragOverUpload ? 'Release to upload files' : 'Drop GeoJSON files here'}
+                  {isDragOverUpload ? 'Release to upload files' : 'Drop GeoJSON or CSV files here'}
                 </p>
                 <p className={`text-xs ${isDragOverUpload ? 'text-indigo-700' : 'text-slate-500'}`}>
                   {isDragOverUpload
                     ? 'Files will be imported and mapped immediately'
-                    : 'or click to browse .geojson and .json files'}
+                    : 'or click to browse .geojson, .json, and .csv files'}
                 </p>
               </div>
             </div>
@@ -2236,84 +2359,10 @@ export default function App() {
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".json,.geojson,application/geo+json,application/json"
+            accept=".json,.geojson,.csv,application/geo+json,application/json,text/csv"
             onChange={handleFileChange}
             className="hidden"
           />
-
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={handleCsvPointUploadClick}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                handleCsvPointUploadClick();
-              }
-            }}
-            onDragEnter={handleCsvUploadDragEnter}
-            onDragOver={handleCsvUploadDragOver}
-            onDragLeave={handleCsvUploadDragLeave}
-            onDrop={handleCsvUploadDrop}
-            className={`group block cursor-pointer rounded-xl border-2 border-dashed p-4 transition ${
-              isDragOverCsvUpload
-                ? 'border-indigo-500 bg-indigo-100/60 ring-2 ring-indigo-200'
-                : 'border-slate-300 bg-slate-50/70 hover:border-indigo-400 hover:bg-indigo-50/50'
-            }`}
-          >
-            <div className="flex items-start gap-3">
-              <div
-                className={`rounded-lg bg-white p-2 text-slate-700 shadow-sm ring-1 ring-slate-200 transition ${
-                  isDragOverCsvUpload ? 'scale-105 text-indigo-700 ring-indigo-300' : ''
-                }`}
-              >
-                <MapPinned className="h-5 w-5" />
-              </div>
-              <div>
-                <p className={`text-sm font-semibold ${isDragOverCsvUpload ? 'text-indigo-800' : 'text-slate-800'}`}>
-                  {isDragOverCsvUpload ? 'Release to upload files' : 'Drop CSV files here'}
-                </p>
-                <p className={`text-xs ${isDragOverCsvUpload ? 'text-indigo-700' : 'text-slate-500'}`}>
-                  {isDragOverCsvUpload
-                    ? 'Files will be imported and mapped immediately'
-                    : 'or click to browse coordinate files with lat/lon columns'}
-                </p>
-              </div>
-            </div>
-
-            <input
-              ref={csvPointFileInputRef}
-              type="file"
-              multiple
-              accept=".csv,text/csv"
-              onChange={handleCsvPointFileChange}
-              className="hidden"
-            />
-
-            {csvPointFiles.length > 0 ? (
-              <div className="mt-2 max-h-24 space-y-1 overflow-y-auto pr-1">
-                {csvPointFiles.map((csvFile) => (
-                  <div key={csvFile.id} className="flex items-center justify-between rounded-md bg-white px-2 py-1 ring-1 ring-slate-200">
-                    <p className="truncate text-[11px] font-medium text-slate-700" title={csvFile.name}>
-                      {csvFile.name} ({csvFile.pointCount.toLocaleString()} pts)
-                    </p>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        handleRemoveCsvPointFile(csvFile.id);
-                      }}
-                      aria-label={`Remove ${csvFile.name}`}
-                      title={`Remove ${csvFile.name}`}
-                      className="ml-2 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-red-600 transition hover:bg-red-50"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </div>
 
           <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
             <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-700">
@@ -2445,10 +2494,83 @@ export default function App() {
             </div>
           )}
 
+          {csvPointFiles.length > 0 ? (
+            <div className="mt-3 rounded-xl border border-emerald-100 bg-linear-to-br from-emerald-50 via-white to-amber-50 p-3">
+              <button
+                type="button"
+                onClick={() => setIsCsvLegendExpanded((previous) => !previous)}
+                className="flex w-full items-center justify-between gap-3 text-left"
+                aria-expanded={isCsvLegendExpanded}
+                aria-controls="csv-boundary-legend"
+              >
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-600">CSV Boundary Legend</p>
+                  <p className="mt-1 text-xs text-slate-600">Point and cluster colors update as GeoJSON boundaries change.</p>
+                </div>
+                <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/80 text-slate-700 ring-1 ring-slate-200">
+                  {isCsvLegendExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                </span>
+              </button>
+
+              <AnimatePresence initial={false}>
+                {isCsvLegendExpanded ? (
+                  <motion.div
+                    id="csv-boundary-legend"
+                    initial={{ height: 0, opacity: 0, y: -6 }}
+                    animate={{ height: 'auto', opacity: 1, y: 0 }}
+                    exit={{ height: 0, opacity: 0, y: -6 }}
+                    transition={{ duration: 0.18, ease: 'easeOut' }}
+                    className="overflow-hidden"
+                  >
+                    <div className="mt-3 grid gap-2 text-xs text-slate-700">
+                      <div className="flex items-center gap-2">
+                        <span className="h-2.5 w-2.5 rounded-full bg-emerald-600 ring-2 ring-emerald-100" />
+                        <span>Inside at least one GeoJSON boundary</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="h-2.5 w-2.5 rounded-full bg-red-600 ring-2 ring-red-100" />
+                        <span>Outside all GeoJSON boundaries</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="h-2.5 w-2.5 rounded-full bg-amber-400 ring-2 ring-amber-100" />
+                        <span>Mixed cluster with inside and outside points</span>
+                      </div>
+                    </div>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+
+              <div className="mt-3 space-y-1">
+                {csvPointFiles.map((csvFile) => (
+                  <div
+                    key={csvFile.id}
+                    className="flex items-center justify-between rounded-lg bg-white/90 px-2.5 py-2 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-slate-800" title={csvFile.name}>
+                        {csvFile.name}
+                      </p>
+                      <p className="text-[11px] text-slate-500">{csvFile.pointCount.toLocaleString()} coordinate points</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveCsvPointFile(csvFile.id)}
+                      aria-label={`Remove ${csvFile.name}`}
+                      title={`Remove ${csvFile.name}`}
+                      className="ml-3 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-red-600 transition hover:bg-red-50"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <div className="mt-3 space-y-3 overflow-y-auto pr-1">
             {filesWithPolygons.length === 0 ? (
               <p className="flex h-full w-full rounded-lg items-center justify-center border border-dashed border-slate-300 bg-slate-50 p-3 text-sm text-slate-500">
-                No files loaded yet.
+                {csvPointFiles.length > 0 ? 'No GeoJSON polygon files loaded yet.' : 'No files loaded yet.'}
               </p>
             ) : (
               filesWithPolygons.map((group) => (
