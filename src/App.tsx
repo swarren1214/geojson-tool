@@ -433,7 +433,8 @@ function removePolygonVertex(
 
 function snapCoordinateToNearbyGeometry(
   map: Map,
-  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  activeFeature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  otherFeatures: Feature<Polygon | MultiPolygon, GeoJsonProperties>[],
   coordinate: [number, number],
   movingReference: PolygonVertexReference,
 ): PolygonSnapResult {
@@ -443,7 +444,17 @@ function snapCoordinateToNearbyGeometry(
   let snapKind: PolygonSnapResult['kind'] = 'none';
   let snapSegment: [[number, number], [number, number]] | undefined;
 
-  getPolygonRings(feature).forEach(({ polygonIndex, ringIndex, ring }) => {
+  const collectRingSnaps = ({
+    ring,
+    polygonIndex,
+    ringIndex,
+    applyMovingVertexExclusions,
+  }: {
+    ring: number[][];
+    polygonIndex: number;
+    ringIndex: number;
+    applyMovingVertexExclusions: boolean;
+  }) => {
     if (ring.length < 2) {
       return;
     }
@@ -451,6 +462,7 @@ function snapCoordinateToNearbyGeometry(
     const uniqueVertexCount = Math.max(0, ring.length - 1);
     for (let coordIndex = 0; coordIndex < uniqueVertexCount; coordIndex++) {
       if (
+        applyMovingVertexExclusions &&
         polygonIndex === movingReference.polygonIndex &&
         ringIndex === movingReference.ringIndex &&
         coordIndex === movingReference.coordIndex
@@ -473,7 +485,11 @@ function snapCoordinateToNearbyGeometry(
 
     for (let segmentIndex = 0; segmentIndex < ring.length - 1; segmentIndex++) {
       // Do not snap against the segments directly adjacent to the vertex being moved.
-      if (polygonIndex === movingReference.polygonIndex && ringIndex === movingReference.ringIndex) {
+      if (
+        applyMovingVertexExclusions &&
+        polygonIndex === movingReference.polygonIndex &&
+        ringIndex === movingReference.ringIndex
+      ) {
         const uniqueVertexCount = Math.max(0, ring.length - 1);
         const previousSegmentIndex =
           movingReference.coordIndex === 0 ? Math.max(0, uniqueVertexCount - 1) : movingReference.coordIndex - 1;
@@ -515,6 +531,26 @@ function snapCoordinateToNearbyGeometry(
         ];
       }
     }
+  };
+
+  getPolygonRings(activeFeature).forEach(({ polygonIndex, ringIndex, ring }) => {
+    collectRingSnaps({
+      ring,
+      polygonIndex,
+      ringIndex,
+      applyMovingVertexExclusions: true,
+    });
+  });
+
+  otherFeatures.forEach((feature) => {
+    getPolygonRings(feature).forEach(({ polygonIndex, ringIndex, ring }) => {
+      collectRingSnaps({
+        ring,
+        polygonIndex,
+        ringIndex,
+        applyMovingVertexExclusions: false,
+      });
+    });
   });
 
   return {
@@ -1342,7 +1378,7 @@ export default function App() {
     coordinates: [],
     cursorCoordinate: null,
   });
-  const [contextMenu, setContextMenu] = useState<ContextMenuState>({
+  const [, setContextMenu] = useState<ContextMenuState>({
     open: false,
     x: 0,
     y: 0,
@@ -2759,7 +2795,9 @@ export default function App() {
         event.preventDefault();
         event.originalEvent.stopPropagation();
 
-        const nextCoordinate: [number, number] = [event.lngLat.lng, event.lngLat.lat];
+        // Use the snapped cursor coordinate if available, otherwise fall back to raw event coords
+        const nextCoordinate: [number, number] =
+          polygonDrawRef.current.cursorCoordinate ?? [event.lngLat.lng, event.lngLat.lat];
         setPolygonDraw((previous) => {
           if (!previous.open) {
             return previous;
@@ -2837,8 +2875,6 @@ export default function App() {
         return;
       }
 
-      const currentName = polygonNameByIdRef.current[appFeatureId] || 'Polygon';
-
       if (selectedFeatureIdRef.current === appFeatureId) {
         clearSelectedFeature(map);
         closeContextMenu();
@@ -2846,14 +2882,8 @@ export default function App() {
         return;
       }
 
-      setContextMenu({
-        open: true,
-        x: event.point.x,
-        y: event.point.y,
-        appFeatureId,
-        nameDraft: currentName,
-      });
       setSelectedFeature(map, appFeatureId);
+      closeContextMenu();
       closePolygonMenu();
     });
 
@@ -2887,7 +2917,45 @@ export default function App() {
 
     map.on('mousemove', (event) => {
       if (polygonDrawRef.current.open) {
-        const nextCoordinate: [number, number] = [event.lngLat.lng, event.lngLat.lat];
+        const rawCoordinate: [number, number] = [event.lngLat.lng, event.lngLat.lat];
+        const targetPoint = map.project(rawCoordinate);
+        let snappedCoordinate: [number, number] = rawCoordinate;
+        let bestSnapDistance = POLYGON_EDIT_SNAP_THRESHOLD_PX;
+
+        // Snap to vertices of existing polygons
+        for (const feature of displayDataRef.current.features) {
+          if (feature.geometry.type !== 'Polygon' && feature.geometry.type !== 'MultiPolygon') {
+            continue;
+          }
+          const polygonFeature = feature as Feature<Polygon | MultiPolygon, GeoJsonProperties>;
+          getPolygonRings(polygonFeature).forEach(({ ring }) => {
+            const uniqueVertexCount = Math.max(0, ring.length - 1);
+            for (let i = 0; i < uniqueVertexCount; i++) {
+              const vertex = ring[i];
+              const projected = map.project([vertex[0], vertex[1]]);
+              const dx = projected.x - targetPoint.x;
+              const dy = projected.y - targetPoint.y;
+              const distance = Math.sqrt(dx * dx + dy * dy);
+              if (distance < bestSnapDistance) {
+                bestSnapDistance = distance;
+                snappedCoordinate = [vertex[0], vertex[1]];
+              }
+            }
+          });
+        }
+
+        // Snap to already-placed draw vertices
+        for (const vertex of polygonDrawRef.current.coordinates) {
+          const projected = map.project([vertex[0], vertex[1]]);
+          const dx = projected.x - targetPoint.x;
+          const dy = projected.y - targetPoint.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          if (distance < bestSnapDistance) {
+            bestSnapDistance = distance;
+            snappedCoordinate = [vertex[0], vertex[1]];
+          }
+        }
+
         setPolygonDraw((previous) => {
           if (!previous.open) {
             return previous;
@@ -2895,24 +2963,36 @@ export default function App() {
 
           if (
             previous.cursorCoordinate &&
-            previous.cursorCoordinate[0] === nextCoordinate[0] &&
-            previous.cursorCoordinate[1] === nextCoordinate[1]
+            previous.cursorCoordinate[0] === snappedCoordinate[0] &&
+            previous.cursorCoordinate[1] === snappedCoordinate[1]
           ) {
             return previous;
           }
 
           return {
             ...previous,
-            cursorCoordinate: nextCoordinate,
+            cursorCoordinate: snappedCoordinate,
           };
         });
-        map.getCanvas().style.cursor = 'crosshair';
+        map.getCanvas().style.cursor = snappedCoordinate !== rawCoordinate ? 'pointer' : 'crosshair';
         return;
       }
 
       if (draggingVertexRef.current && polygonGeometryEditRef.current.draftFeature) {
         const activeDragReference = draggingVertexRef.current;
         const isSnapSuppressed = (event.originalEvent as MouseEvent).altKey;
+        const activeFeatureId = polygonGeometryEditRef.current.draftFeature.properties?.appFeatureId;
+        const otherPolygonFeatures = displayDataRef.current.features.filter((feature) => {
+          if (!isPolygonFeature(feature as Feature<Geometry, GeoJsonProperties>)) {
+            return false;
+          }
+
+          if (activeFeatureId && feature.properties?.appFeatureId === activeFeatureId) {
+            return false;
+          }
+
+          return true;
+        }) as Feature<Polygon | MultiPolygon, GeoJsonProperties>[];
         const snapResult = isSnapSuppressed
           ? {
               coordinate: [event.lngLat.lng, event.lngLat.lat] as [number, number],
@@ -2922,6 +3002,7 @@ export default function App() {
           : snapCoordinateToNearbyGeometry(
               map,
               polygonGeometryEditRef.current.draftFeature,
+              otherPolygonFeatures,
               [event.lngLat.lng, event.lngLat.lat],
               activeDragReference,
             );
@@ -3927,15 +4008,6 @@ export default function App() {
     URL.revokeObjectURL(href);
   }
 
-  function handleSaveContextMenuRename() {
-    if (!contextMenu.appFeatureId) {
-      return;
-    }
-
-    handlePolygonNameChange(contextMenu.appFeatureId, contextMenu.nameDraft);
-    closeContextMenu();
-  }
-
   const isUploadBusy = isHandlingUploads || isRestoringWorkspace;
   const activeUploadStatusMessage = isRestoringWorkspace
     ? 'Restoring saved workspace from this browser...'
@@ -4629,75 +4701,6 @@ export default function App() {
           className="h-[58vh] w-full overflow-hidden rounded-3xl border border-slate-200 shadow-[0_28px_70px_rgba(15,23,42,0.18)] lg:h-[calc(100vh-2rem)]"
         />
 
-        {contextMenu.open ? (
-          <div
-            className="absolute z-20 grid min-w-65 gap-2 rounded-xl border border-slate-300 bg-white p-2 shadow-2xl"
-            style={{ left: `${contextMenu.x + 20}px`, top: `${contextMenu.y + 20}px` }}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-              <Tag className="h-3.5 w-3.5" />
-              Polygon Name
-            </label>
-            <input
-              value={contextMenu.nameDraft}
-              onChange={(event) =>
-                setContextMenu((previous) => ({
-                  ...previous,
-                  nameDraft: event.target.value,
-                }))
-              }
-              className="rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-              placeholder="Polygon name"
-            />
-
-            <div className="grid grid-cols-3 gap-1.5">
-              <button
-                onClick={handleSaveContextMenuRename}
-                className="inline-flex items-center justify-center gap-1 rounded-md bg-slate-200 px-2 py-2 text-xs font-medium text-slate-800 transition hover:bg-slate-300"
-              >
-                <PenLine className="h-3.5 w-3.5" />
-                Rename
-              </button>
-              <button
-                onClick={() => contextMenu.appFeatureId && void handleSplitFeatureById(contextMenu.appFeatureId)}
-                disabled={
-                  !contextMenu.appFeatureId ||
-                  splittingFeatureIds.has(contextMenu.appFeatureId) ||
-                  isSplittingAll
-                }
-                className="inline-flex items-center justify-center gap-1 rounded-md bg-indigo-600 px-2 py-2 text-xs font-medium text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-indigo-300"
-              >
-                {contextMenu.appFeatureId && splittingFeatureIds.has(contextMenu.appFeatureId) ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Scissors className="h-3.5 w-3.5" />
-                )}
-                {contextMenu.appFeatureId && splittingFeatureIds.has(contextMenu.appFeatureId)
-                  ? 'Splitting...'
-                  : 'Split by State'}
-              </button>
-              <button
-                onClick={() => contextMenu.appFeatureId && handleDeleteFeatureById(contextMenu.appFeatureId)}
-                className="inline-flex items-center justify-center gap-1 rounded-md bg-red-600 px-2 py-2 text-xs font-medium text-white transition hover:bg-red-500"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                Remove
-              </button>
-            </div>
-
-            {contextMenu.appFeatureId &&
-            polygonItems.find((item) => item.appFeatureId === contextMenu.appFeatureId)?.isMultiPolygon ? (
-              <button
-                onClick={() => handleSeparatePartsById(contextMenu.appFeatureId as string)}
-                className="inline-flex items-center justify-center gap-1 rounded-md bg-sky-600 px-2 py-2 text-xs font-medium text-white transition hover:bg-sky-500"
-              >
-                <Braces className="h-3.5 w-3.5" />
-                Separate Parts
-              </button>
-            ) : null}
-          </div>
-        ) : null}
       </main>
     </div>
   );
