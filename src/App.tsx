@@ -48,6 +48,10 @@ const POLYGON_HOVER_FILL_COLOR = '#0f172a';
 const CSV_INSIDE_COLOR = '#16a34a';
 const CSV_OUTSIDE_COLOR = '#dc2626';
 const CSV_MIXED_CLUSTER_COLOR = '#facc15';
+const WORKSPACE_DB_NAME = 'geojson-tool-workspace';
+const WORKSPACE_DB_VERSION = 1;
+const WORKSPACE_STORE_NAME = 'workspace';
+const WORKSPACE_SNAPSHOT_KEY = 'current';
 
 type PolygonBoundaryIndexItem = {
   feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>;
@@ -406,6 +410,84 @@ type WorkspaceSnapshot = {
   polygonNames: Record<string, string>;
 };
 
+function openWorkspaceDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !('indexedDB' in window)) {
+      reject(new Error('IndexedDB is not available.'));
+      return;
+    }
+
+    const request = window.indexedDB.open(WORKSPACE_DB_NAME, WORKSPACE_DB_VERSION);
+
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(WORKSPACE_STORE_NAME)) {
+        database.createObjectStore(WORKSPACE_STORE_NAME);
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('Could not open workspace database.'));
+  });
+}
+
+async function loadPersistedWorkspaceSnapshot(): Promise<WorkspaceSnapshot | null> {
+  const database = await openWorkspaceDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(WORKSPACE_STORE_NAME, 'readonly');
+    const store = transaction.objectStore(WORKSPACE_STORE_NAME);
+    const request = store.get(WORKSPACE_SNAPSHOT_KEY);
+
+    request.onsuccess = () => resolve((request.result as WorkspaceSnapshot | undefined) ?? null);
+    request.onerror = () => reject(request.error ?? new Error('Could not read persisted workspace.'));
+    transaction.oncomplete = () => database.close();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not read persisted workspace.'));
+  });
+}
+
+async function savePersistedWorkspaceSnapshot(snapshot: WorkspaceSnapshot): Promise<void> {
+  const database = await openWorkspaceDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(WORKSPACE_STORE_NAME);
+    store.put(snapshot, WORKSPACE_SNAPSHOT_KEY);
+
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not persist workspace.'));
+  });
+}
+
+async function clearPersistedWorkspaceSnapshot(): Promise<void> {
+  const database = await openWorkspaceDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(WORKSPACE_STORE_NAME);
+    store.delete(WORKSPACE_SNAPSHOT_KEY);
+
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not clear persisted workspace.'));
+  });
+}
+
+function isWorkspaceSnapshotEmpty(snapshot: WorkspaceSnapshot): boolean {
+  return (
+    snapshot.displayData.features.length === 0 &&
+    snapshot.csvPointData.features.length === 0 &&
+    snapshot.csvPointFiles.length === 0 &&
+    snapshot.uploadedFiles.length === 0 &&
+    Object.keys(snapshot.polygonNames).length === 0
+  );
+}
+
 type GeometryMetrics = {
   vertices: number;
   edges: number;
@@ -680,6 +762,10 @@ export default function App() {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFileMeta[]>([]);
   const [error, setError] = useState<string>('');
   const [isDragOverUpload, setIsDragOverUpload] = useState<boolean>(false);
+  const [isHandlingUploads, setIsHandlingUploads] = useState<boolean>(false);
+  const [uploadStatusMessage, setUploadStatusMessage] = useState<string>('');
+  const [isRestoringWorkspace, setIsRestoringWorkspace] = useState<boolean>(true);
+  const [isMapStyleReady, setIsMapStyleReady] = useState<boolean>(false);
   const [showStates, setShowStates] = useState<boolean>(false);
   const [isSplittingAll, setIsSplittingAll] = useState<boolean>(false);
   const [splittingFeatureIds, setSplittingFeatureIds] = useState<Set<string>>(new Set());
@@ -719,6 +805,7 @@ export default function App() {
   const pendingFitBoundsRef = useRef<LngLatBoundsLike | null>(null);
   const uploadDragDepthRef = useRef<number>(0);
   const polygonColorByIdRef = useRef<Record<string, string>>({});
+  const hasRestoredWorkspaceRef = useRef<boolean>(false);
 
   function createWorkspaceSnapshot(): WorkspaceSnapshot {
     return {
@@ -846,6 +933,16 @@ export default function App() {
     csvSource?.setData(getClassifiedCsvPointData(csvData, boundaryIndex));
   }
 
+  function syncGeoJsonSource(data: AnyFeatureCollection) {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const geoJsonSource = map.getSource('geojson-data') as GeoJSONSource | undefined;
+    geoJsonSource?.setData(withPolygonColors(data, buildPolygonColorById(data)));
+  }
+
   useEffect(() => {
     displayDataRef.current = displayData;
   }, [displayData]);
@@ -853,6 +950,57 @@ export default function App() {
   useEffect(() => {
     csvPointDataRef.current = csvPointData;
   }, [csvPointData]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    async function restorePersistedWorkspace() {
+      try {
+        const snapshot = await loadPersistedWorkspaceSnapshot();
+        if (isCancelled || !snapshot) {
+          return;
+        }
+
+        applyWorkspaceSnapshot(snapshot);
+        setUndoStack([]);
+        setRedoStack([]);
+
+        const restoredFeatures = [...snapshot.displayData.features, ...snapshot.csvPointData.features];
+        if (restoredFeatures.length > 0) {
+          fitMapToCollection({
+            type: 'FeatureCollection',
+            features: restoredFeatures,
+          });
+        }
+      } catch {
+      } finally {
+        if (!isCancelled) {
+          hasRestoredWorkspaceRef.current = true;
+          setIsRestoringWorkspace(false);
+        }
+      }
+    }
+
+    void restorePersistedWorkspace();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hasRestoredWorkspaceRef.current) {
+      return;
+    }
+
+    const snapshot = createWorkspaceSnapshot();
+    if (isWorkspaceSnapshotEmpty(snapshot)) {
+      void clearPersistedWorkspaceSnapshot().catch(() => undefined);
+      return;
+    };
+
+    void savePersistedWorkspaceSnapshot(snapshot).catch(() => undefined);
+  }, [displayData, csvPointData, csvPointFiles, uploadedFiles, polygonNames]);
 
   const polygonColorById = useMemo(() => buildPolygonColorById(displayData), [displayData]);
 
@@ -1391,6 +1539,7 @@ export default function App() {
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
     map.on('style.load', () => {
+      setIsMapStyleReady(true);
       ensureMapDataLayers(map);
 
       if (pendingFitBoundsRef.current) {
@@ -1498,6 +1647,7 @@ export default function App() {
     mapRef.current = map;
 
     return () => {
+      setIsMapStyleReady(false);
       clearHoveredFeature(map);
       clearSelectedFeature(map);
       map.remove();
@@ -1507,24 +1657,24 @@ export default function App() {
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map?.isStyleLoaded()) {
+    if (!map || !isMapStyleReady) {
       return;
     }
 
     const source = map.getSource('geojson-data') as GeoJSONSource | undefined;
     source?.setData(withPolygonColors(smoothPreviewData, polygonColorByIdRef.current));
     clearHoveredFeature(map);
-  }, [smoothPreviewData]);
+  }, [isMapStyleReady, smoothPreviewData]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map?.isStyleLoaded()) {
+    if (!map || !isMapStyleReady) {
       return;
     }
 
     const source = map.getSource('csv-point-data') as GeoJSONSource | undefined;
     source?.setData(getClassifiedCsvPointData(csvPointData, polygonBoundaryIndex));
-  }, [csvPointData, polygonBoundaryIndex]);
+  }, [csvPointData, isMapStyleReady, polygonBoundaryIndex]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1608,12 +1758,14 @@ export default function App() {
       setDisplayData(newDisplayData);
       setUploadedFiles((previous) => [...previous, ...importedFiles]);
 
-      syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
-
       fitMapToCollection({
         type: 'FeatureCollection',
         features: importedFeatures,
       });
+
+      syncGeoJsonSource(newDisplayData);
+
+      syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
     }
 
     if (failedFiles.length > 0) {
@@ -1633,7 +1785,7 @@ export default function App() {
   }
 
   async function handleMixedFileImport(selectedFiles: File[]) {
-    if (!selectedFiles.length) {
+    if (!selectedFiles.length || isHandlingUploads || isRestoringWorkspace) {
       return;
     }
 
@@ -1657,30 +1809,48 @@ export default function App() {
       unsupportedFiles.push(selectedFile.name);
     });
 
-    if (geoJsonFiles.length > 0) {
-      await importGeoJsonFiles(geoJsonFiles);
-    }
+    setIsHandlingUploads(true);
+    setOperationAlert(null);
+    setUploadStatusMessage(
+      `Preparing ${selectedFiles.length} file${selectedFiles.length === 1 ? '' : 's'} for import...`,
+    );
+    await waitForUiPaint();
 
-    if (csvFiles.length > 0) {
-      await importCsvPointFiles(csvFiles);
-    }
-
-    if (unsupportedFiles.length > 0) {
-      const unsupportedMessage = `Unsupported file type${unsupportedFiles.length === 1 ? '' : 's'}: ${unsupportedFiles.join(', ')}`;
-
-      if (geoJsonFiles.length > 0 || csvFiles.length > 0) {
-        setError('');
-        setOperationAlert({
-          type: 'error',
-          message: unsupportedMessage,
-        });
-      } else {
-        setError(unsupportedMessage);
+    try {
+      if (geoJsonFiles.length > 0) {
+        setUploadStatusMessage(
+          `Processing ${geoJsonFiles.length} GeoJSON file${geoJsonFiles.length === 1 ? '' : 's'}...`,
+        );
+        await waitForUiPaint();
+        await importGeoJsonFiles(geoJsonFiles);
       }
-    }
 
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
+      if (csvFiles.length > 0) {
+        setUploadStatusMessage(`Processing ${csvFiles.length} CSV file${csvFiles.length === 1 ? '' : 's'}...`);
+        await waitForUiPaint();
+        await importCsvPointFiles(csvFiles);
+      }
+
+      if (unsupportedFiles.length > 0) {
+        const unsupportedMessage = `Unsupported file type${unsupportedFiles.length === 1 ? '' : 's'}: ${unsupportedFiles.join(', ')}`;
+
+        if (geoJsonFiles.length > 0 || csvFiles.length > 0) {
+          setError('');
+          setOperationAlert({
+            type: 'error',
+            message: unsupportedMessage,
+          });
+        } else {
+          setError(unsupportedMessage);
+        }
+      }
+    } finally {
+      setIsHandlingUploads(false);
+      setUploadStatusMessage('');
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
     }
   }
 
@@ -1758,6 +1928,10 @@ export default function App() {
   }
 
   function handleUploadDropZoneClick() {
+    if (isHandlingUploads || isRestoringWorkspace) {
+      return;
+    }
+
     fileInputRef.current?.click();
   }
 
@@ -1778,6 +1952,11 @@ export default function App() {
   function handleUploadDragEnter(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
+
+    if (isHandlingUploads || isRestoringWorkspace) {
+      return;
+    }
+
     uploadDragDepthRef.current += 1;
     setIsDragOverUpload(true);
   }
@@ -1785,6 +1964,11 @@ export default function App() {
   function handleUploadDragOver(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
+
+    if (isHandlingUploads || isRestoringWorkspace) {
+      return;
+    }
+
     if (!isDragOverUpload) {
       setIsDragOverUpload(true);
     }
@@ -1793,6 +1977,11 @@ export default function App() {
   function handleUploadDragLeave(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
+
+    if (isHandlingUploads || isRestoringWorkspace) {
+      return;
+    }
+
     uploadDragDepthRef.current = Math.max(0, uploadDragDepthRef.current - 1);
     if (uploadDragDepthRef.current === 0) {
       setIsDragOverUpload(false);
@@ -1802,6 +1991,11 @@ export default function App() {
   async function handleUploadDrop(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
+
+    if (isHandlingUploads || isRestoringWorkspace) {
+      return;
+    }
+
     uploadDragDepthRef.current = 0;
     setIsDragOverUpload(false);
 
@@ -1823,6 +2017,7 @@ export default function App() {
     };
     setDisplayData(newDisplayData);
     setUploadedFiles((previous) => previous.filter((file) => file.id !== fileId));
+    syncGeoJsonSource(newDisplayData);
     syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
     closePolygonMenu();
 
@@ -1840,6 +2035,8 @@ export default function App() {
     setDisplayData(EMPTY_COLLECTION);
     setCsvPointData(EMPTY_COLLECTION);
     setCsvPointFiles([]);
+    syncGeoJsonSource(EMPTY_COLLECTION);
+    syncCsvPointSource(EMPTY_COLLECTION, []);
     setError('');
     setPolygonNames({});
     setMergeMode(false);
@@ -1857,7 +2054,11 @@ export default function App() {
       fileInputRef.current.value = '';
     }
 
+    void clearPersistedWorkspaceSnapshot().catch(() => undefined);
+
     setIsDragOverUpload(false);
+    setIsHandlingUploads(false);
+    setUploadStatusMessage('');
     uploadDragDepthRef.current = 0;
   }
 
@@ -2294,6 +2495,11 @@ export default function App() {
     closeContextMenu();
   }
 
+  const isUploadBusy = isHandlingUploads || isRestoringWorkspace;
+  const activeUploadStatusMessage = isRestoringWorkspace
+    ? 'Restoring saved workspace from this browser...'
+    : uploadStatusMessage || 'Processing files...';
+
   return (
     <div className="flex h-full min-h-screen bg-[#f2f4f7] text-slate-900">
       <aside className="flex w-full max-w-107.5 flex-col border-r border-slate-200 bg-linear-to-b from-[#fffdf8] to-[#f3f5ff] p-5 lg:p-6">
@@ -2319,7 +2525,12 @@ export default function App() {
             role="button"
             tabIndex={0}
             onClick={handleUploadDropZoneClick}
+            aria-disabled={isUploadBusy}
             onKeyDown={(event) => {
+              if (isUploadBusy) {
+                return;
+              }
+
               if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
                 handleUploadDropZoneClick();
@@ -2330,7 +2541,9 @@ export default function App() {
             onDragLeave={handleUploadDragLeave}
             onDrop={handleUploadDrop}
             className={`group block cursor-pointer rounded-xl border-2 border-dashed p-4 transition ${
-              isDragOverUpload
+              isUploadBusy
+                ? 'cursor-wait border-indigo-300 bg-indigo-50/70 opacity-80'
+                : isDragOverUpload
                 ? 'border-indigo-500 bg-indigo-100/60 ring-2 ring-indigo-200'
                 : 'border-slate-300 bg-slate-50/70 hover:border-indigo-400 hover:bg-indigo-50/50'
             }`}
@@ -2338,19 +2551,29 @@ export default function App() {
             <div className="flex items-start gap-3">
               <div
                 className={`rounded-lg bg-white p-2 text-slate-700 shadow-sm ring-1 ring-slate-200 transition ${
-                  isDragOverUpload ? 'scale-105 text-indigo-700 ring-indigo-300' : ''
+                  isUploadBusy
+                    ? 'text-indigo-700 ring-indigo-200'
+                    : isDragOverUpload
+                    ? 'scale-105 text-indigo-700 ring-indigo-300'
+                    : ''
                 }`}
               >
-                <FileUp className="h-5 w-5" />
+                {isUploadBusy ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileUp className="h-5 w-5" />}
               </div>
               <div>
-                <p className={`text-sm font-semibold ${isDragOverUpload ? 'text-indigo-800' : 'text-slate-800'}`}>
-                  {isDragOverUpload ? 'Release to upload files' : 'Drop GeoJSON or CSV files here'}
+                <p
+                  className={`text-sm font-semibold ${
+                    isUploadBusy ? 'text-indigo-800' : isDragOverUpload ? 'text-indigo-800' : 'text-slate-800'
+                  }`}
+                >
+                  {isUploadBusy ? activeUploadStatusMessage : isDragOverUpload ? 'Release to upload files' : 'Drop GeoJSON or CSV files here'}
                 </p>
-                <p className={`text-xs ${isDragOverUpload ? 'text-indigo-700' : 'text-slate-500'}`}>
-                  {isDragOverUpload
+                <p className={`text-xs ${isUploadBusy || isDragOverUpload ? 'text-indigo-700' : 'text-slate-500'}`}>
+                  {isUploadBusy
+                    ? 'Large files can take a moment to parse, classify, and render.'
+                    : isDragOverUpload
                     ? 'Files will be imported and mapped immediately'
-                    : 'or click to browse .geojson, .json, and .csv files'}
+                    : 'or click to browse device files'}
                 </p>
               </div>
             </div>
@@ -2363,6 +2586,13 @@ export default function App() {
             onChange={handleFileChange}
             className="hidden"
           />
+
+          {isUploadBusy ? (
+            <p role="status" className="flex items-center gap-2 text-sm font-semibold text-indigo-700">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {activeUploadStatusMessage}
+            </p>
+          ) : null}
 
           <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
             <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-700">
@@ -2434,7 +2664,7 @@ export default function App() {
                 disabled={!polygonItems.length || isSplittingAll || splittingFeatureIds.size > 0}
                 ariaLabel={isSplittingAll || splittingFeatureIds.size > 0 ? 'Splitting polygons' : 'Split All by State'}
                 tooltip={isSplittingAll || splittingFeatureIds.size > 0 ? 'Splitting...' : 'Split All by State'}
-                className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-slate-900 text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                className="inline-flex h-9 w-full items-center justify-center rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 transition hover:bg-indigo-100 disabled:cursor-not-allowed disabled:border-indigo-100 disabled:bg-indigo-50/60 disabled:text-indigo-300"
               >
                 {isSplittingAll || splittingFeatureIds.size > 0 ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -2447,7 +2677,7 @@ export default function App() {
                 disabled={!uploadedFiles.length && !csvPointData.features.length}
                 ariaLabel="Clear All Files"
                 tooltip="Clear All Files"
-                className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-red-600 text-white transition hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-red-200"
+                className="inline-flex h-9 w-full items-center justify-center rounded-lg border border-red-200 bg-red-50 text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:border-red-100 disabled:bg-red-50/60 disabled:text-red-300"
               >
                 <Trash2 className="h-4 w-4" />
               </ToolbarActionButton>
@@ -2507,7 +2737,7 @@ export default function App() {
                   <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-600">CSV Boundary Legend</p>
                   <p className="mt-1 text-xs text-slate-600">Point and cluster colors update as GeoJSON boundaries change.</p>
                 </div>
-                <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/80 text-slate-700 ring-1 ring-slate-200">
+                <span className="inline-flex p-2 items-center justify-center rounded-lg bg-white/80 text-slate-700 ring-1 ring-slate-200">
                   {isCsvLegendExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                 </span>
               </button>
