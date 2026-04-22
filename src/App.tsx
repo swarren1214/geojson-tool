@@ -48,6 +48,9 @@ const POLYGON_HOVER_FILL_COLOR = '#0f172a';
 const CSV_INSIDE_COLOR = '#16a34a';
 const CSV_OUTSIDE_COLOR = '#dc2626';
 const CSV_MIXED_CLUSTER_COLOR = '#facc15';
+const SMOOTH_PANEL_WIDTH_PX = 288;
+const SMOOTH_PANEL_VIEWPORT_MARGIN_PX = 16;
+const SMOOTH_PANEL_ESTIMATED_HEIGHT_PX = 420;
 const WORKSPACE_DB_NAME = 'geojson-tool-workspace';
 const WORKSPACE_DB_VERSION = 1;
 const WORKSPACE_STORE_NAME = 'workspace';
@@ -2214,8 +2217,21 @@ export default function App() {
     }
 
     const rect = anchorElement?.getBoundingClientRect();
-    const x = rect ? rect.right - 288 : 24;
-    const y = rect ? rect.bottom + 8 : 28;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    const preferredX = rect ? rect.right - SMOOTH_PANEL_WIDTH_PX : 24;
+    const minX = SMOOTH_PANEL_VIEWPORT_MARGIN_PX;
+    const maxX = Math.max(minX, viewportWidth - SMOOTH_PANEL_WIDTH_PX - SMOOTH_PANEL_VIEWPORT_MARGIN_PX);
+    const x = Math.max(minX, Math.min(preferredX, maxX));
+
+    const preferredY = rect ? rect.bottom + 8 : 28;
+    const maxYBelow = viewportHeight - SMOOTH_PANEL_ESTIMATED_HEIGHT_PX - SMOOTH_PANEL_VIEWPORT_MARGIN_PX;
+    const fallbackAbove = rect ? rect.top - SMOOTH_PANEL_ESTIMATED_HEIGHT_PX - 8 : SMOOTH_PANEL_VIEWPORT_MARGIN_PX;
+    const preferredYWithFlip = preferredY <= maxYBelow ? preferredY : fallbackAbove;
+    const minY = SMOOTH_PANEL_VIEWPORT_MARGIN_PX;
+    const maxY = Math.max(minY, viewportHeight - SMOOTH_PANEL_VIEWPORT_MARGIN_PX - 140);
+    const y = Math.max(minY, Math.min(preferredYWithFlip, maxY));
 
     setSmoothPanel({
       open: true,
@@ -3029,10 +3045,10 @@ export default function App() {
       {smoothPanel.open ? (
         <div className="fixed inset-0 z-35" onClick={closeSmoothPanel}>
           <div
-            className="absolute w-72 rounded-xl border border-slate-300 bg-white p-3 shadow-2xl"
+            className="absolute w-72 max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-slate-300 bg-white p-3 shadow-2xl"
             style={{
-              left: `${Math.min(smoothPanel.x, window.innerWidth - 304)}px`,
-              top: `${Math.min(smoothPanel.y, window.innerHeight - 260)}px`,
+              left: `${smoothPanel.x}px`,
+              top: `${smoothPanel.y}px`,
             }}
             onClick={(event) => event.stopPropagation()}
           >
