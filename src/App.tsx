@@ -1344,6 +1344,7 @@ export default function App() {
   const [splittingFeatureIds, setSplittingFeatureIds] = useState<Set<string>>(new Set());
   const [operationAlert, setOperationAlert] = useState<OperationAlertState | null>(null);
   const [isCsvLegendExpanded, setIsCsvLegendExpanded] = useState<boolean>(false);
+  const [collapsedFileGroupIds, setCollapsedFileGroupIds] = useState<Set<string>>(new Set());
   const [collapsedPolygonIds, setCollapsedPolygonIds] = useState<Set<string>>(new Set());
   const [polygonNames, setPolygonNames] = useState<Record<string, string>>({});
   const [editingPolygonId, setEditingPolygonId] = useState<string | null>(null);
@@ -2173,6 +2174,33 @@ export default function App() {
       return next;
     });
   }, [polygonItems]);
+
+  useEffect(() => {
+    setCollapsedFileGroupIds((previous) => {
+      const validIds = new Set(filesWithPolygons.map((group) => group.id));
+      const next = new Set<string>();
+
+      previous.forEach((id) => {
+        if (validIds.has(id)) {
+          next.add(id);
+        }
+      });
+
+      return next;
+    });
+  }, [filesWithPolygons]);
+
+  function toggleFileGroupExpanded(fileGroupId: string) {
+    setCollapsedFileGroupIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(fileGroupId)) {
+        next.delete(fileGroupId);
+      } else {
+        next.add(fileGroupId);
+      }
+      return next;
+    });
+  }
 
   function togglePolygonExpanded(appFeatureId: string) {
     setCollapsedPolygonIds((previous) => {
@@ -3301,16 +3329,33 @@ export default function App() {
     const geoJsonFiles: File[] = [];
     const csvFiles: File[] = [];
     const unsupportedFiles: string[] = [];
+    const duplicateFiles: string[] = [];
+    const existingGeoJsonNames = new Set(uploadedFiles.map((file) => file.name.trim().toLowerCase()));
+    const existingCsvNames = new Set(csvPointFiles.map((file) => file.name.trim().toLowerCase()));
+    const queuedGeoJsonNames = new Set<string>();
+    const queuedCsvNames = new Set<string>();
 
     selectedFiles.forEach((selectedFile) => {
       const normalizedName = selectedFile.name.trim().toLowerCase();
 
       if (normalizedName.endsWith('.csv')) {
+        if (existingCsvNames.has(normalizedName) || queuedCsvNames.has(normalizedName)) {
+          duplicateFiles.push(selectedFile.name);
+          return;
+        }
+
+        queuedCsvNames.add(normalizedName);
         csvFiles.push(selectedFile);
         return;
       }
 
       if (normalizedName.endsWith('.geojson') || normalizedName.endsWith('.json')) {
+        if (existingGeoJsonNames.has(normalizedName) || queuedGeoJsonNames.has(normalizedName)) {
+          duplicateFiles.push(selectedFile.name);
+          return;
+        }
+
+        queuedGeoJsonNames.add(normalizedName);
         geoJsonFiles.push(selectedFile);
         return;
       }
@@ -3351,6 +3396,20 @@ export default function App() {
           });
         } else {
           setError(unsupportedMessage);
+        }
+      }
+
+      if (duplicateFiles.length > 0) {
+        const duplicateMessage = `Duplicate file${duplicateFiles.length === 1 ? '' : 's'} skipped: ${duplicateFiles.join(', ')}`;
+
+        if (geoJsonFiles.length > 0 || csvFiles.length > 0 || unsupportedFiles.length > 0) {
+          setError('');
+          setOperationAlert({
+            type: 'error',
+            message: duplicateMessage,
+          });
+        } else {
+          setError(duplicateMessage);
         }
       }
     } finally {
@@ -4346,7 +4405,11 @@ export default function App() {
             ) : (
               filesWithPolygons.map((group) => (
                 <article key={group.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3 overflow-visible">
-                  <div className="mb-3 flex items-start justify-between gap-2">
+                  {(() => {
+                    const isGroupCollapsed = collapsedFileGroupIds.has(group.id);
+                    return (
+                      <>
+                  <div className="flex items-start justify-between gap-2">
                     <div>
                       <p className="max-w-55 truncate text-sm font-bold text-slate-900">{group.name}</p>
                       <p className="text-xs text-slate-500">
@@ -4368,10 +4431,29 @@ export default function App() {
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => toggleFileGroupExpanded(group.id)}
+                        aria-label={isGroupCollapsed ? `Expand ${group.name}` : `Collapse ${group.name}`}
+                        title={isGroupCollapsed ? `Expand ${group.name}` : `Collapse ${group.name}`}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-100 p-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-200"
+                      >
+                        {isGroupCollapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+                      </button>
                     </div>
                   </div>
 
-                  <div className="space-y-2">
+                  <AnimatePresence initial={false}>
+                    {!isGroupCollapsed ? (
+                      <motion.div
+                        key={`file-group-${group.id}`}
+                        initial={{ height: 0, opacity: 0, y: -4 }}
+                        animate={{ height: 'auto', opacity: 1, y: 0 }}
+                        exit={{ height: 0, opacity: 0, y: -4 }}
+                        transition={{ duration: 0.2, ease: 'easeInOut' }}
+                        className="overflow-hidden"
+                      >
+                  <div className="mt-3 space-y-2">
                     {group.polygons.length === 0 ? (
                       <p className="flex h-full w-full rounded-lg items-center justify-center border border-dashed border-slate-300 bg-white p-2 text-xs text-slate-500">
                         No polygons from this file are currently visible.
@@ -4583,6 +4665,12 @@ export default function App() {
                       })
                     )}
                   </div>
+                      </motion.div>
+                    ) : null}
+                  </AnimatePresence>
+                      </>
+                    );
+                  })()}
                 </article>
               ))
             )}
