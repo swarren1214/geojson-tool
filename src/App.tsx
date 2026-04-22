@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEven
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map } from 'maplibre-gl';
 import { AnimatePresence, motion } from 'framer-motion';
 import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
-import type { Feature, GeoJsonProperties, Geometry, MultiPolygon, Point, Polygon } from 'geojson';
+import type { Feature, GeoJsonProperties, Geometry, LineString, MultiPolygon, Point, Polygon } from 'geojson';
 import {
   Braces,
   Check,
@@ -14,6 +14,7 @@ import {
   Loader2,
   MapPinned,
   Merge,
+  Plus,
   Pencil,
   PenLine,
   Redo2,
@@ -60,6 +61,10 @@ const POLYGON_EDIT_VERTICES_LAYER_ID = 'polygon-edit-vertices-layer';
 const POLYGON_EDIT_SNAP_POINT_LAYER_ID = 'polygon-edit-snap-point-layer';
 const POLYGON_EDIT_SNAP_SEGMENT_LAYER_ID = 'polygon-edit-snap-segment-layer';
 const POLYGON_EDIT_SNAP_THRESHOLD_PX = 10;
+const POLYGON_DRAW_PREVIEW_SOURCE_ID = 'polygon-draw-preview';
+const POLYGON_DRAW_FILL_LAYER_ID = 'polygon-draw-fill-layer';
+const POLYGON_DRAW_LINE_LAYER_ID = 'polygon-draw-line-layer';
+const POLYGON_DRAW_VERTICES_LAYER_ID = 'polygon-draw-vertices-layer';
 const WORKSPACE_DB_NAME = 'geojson-tool-workspace';
 const WORKSPACE_DB_VERSION = 1;
 const WORKSPACE_STORE_NAME = 'workspace';
@@ -300,6 +305,31 @@ function findNearestSegmentForCoordinate(
   });
 
   return bestMatch;
+}
+
+function getSegmentCoordinates(
+  feature: Feature<Polygon | MultiPolygon, GeoJsonProperties>,
+  reference: PolygonSegmentReference,
+): [[number, number], [number, number]] | null {
+  const rings = getPolygonRings(feature);
+  const ring = rings.find(
+    (candidate) =>
+      candidate.polygonIndex === reference.polygonIndex && candidate.ringIndex === reference.ringIndex,
+  )?.ring;
+  if (!ring) {
+    return null;
+  }
+
+  const start = ring[reference.segmentIndex];
+  const end = ring[reference.segmentIndex + 1];
+  if (!start || !end) {
+    return null;
+  }
+
+  return [
+    [start[0], start[1]],
+    [end[0], end[1]],
+  ];
 }
 
 function insertPolygonVertexOnSegment(
@@ -845,6 +875,14 @@ type PolygonGeometryEditState = {
   snapKind: 'none' | 'vertex' | 'edge';
 };
 
+type PolygonDrawState = {
+  open: boolean;
+  sourceFileId: string | null;
+  sourceFileName: string;
+  coordinates: [number, number][];
+  cursorCoordinate: [number, number] | null;
+};
+
 type WorkspaceSnapshot = {
   displayData: AnyFeatureCollection;
   csvPointData: AnyFeatureCollection;
@@ -1100,6 +1138,62 @@ function withFeatureIds(data: AnyFeatureCollection, prefix: string): AnyFeatureC
   };
 }
 
+function buildPolygonDrawPreviewCollection(drawState: PolygonDrawState): AnyFeatureCollection {
+  if (!drawState.open) {
+    return EMPTY_COLLECTION;
+  }
+
+  const features: Feature<Geometry, GeoJsonProperties>[] = [];
+  const coordinates = drawState.coordinates;
+
+  if (coordinates.length >= 3) {
+    features.push({
+      type: 'Feature',
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[...coordinates, [...coordinates[0]]]],
+      },
+      properties: {
+        preview: true,
+      },
+    });
+  }
+
+  const lineCoordinates = drawState.cursorCoordinate
+    ? [...coordinates, drawState.cursorCoordinate]
+    : [...coordinates];
+  if (lineCoordinates.length >= 2) {
+    features.push({
+      type: 'Feature',
+      geometry: {
+        type: 'LineString',
+        coordinates: lineCoordinates,
+      } as LineString,
+      properties: {
+        preview: true,
+      },
+    });
+  }
+
+  coordinates.forEach((coordinate, index) => {
+    features.push({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [coordinate[0], coordinate[1]],
+      },
+      properties: {
+        vertexIndex: index,
+      },
+    });
+  });
+
+  return {
+    type: 'FeatureCollection',
+    features,
+  };
+}
+
 function isPolygonFeature(feature: Feature<Geometry, GeoJsonProperties>): boolean {
   return feature.geometry?.type === 'Polygon' || feature.geometry?.type === 'MultiPolygon';
 }
@@ -1241,6 +1335,13 @@ export default function App() {
     snapSegment: null,
     snapKind: 'none',
   });
+  const [polygonDraw, setPolygonDraw] = useState<PolygonDrawState>({
+    open: false,
+    sourceFileId: null,
+    sourceFileName: '',
+    coordinates: [],
+    cursorCoordinate: null,
+  });
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     open: false,
     x: 0,
@@ -1260,6 +1361,7 @@ export default function App() {
   const polygonColorByIdRef = useRef<Record<string, string>>({});
   const hasRestoredWorkspaceRef = useRef<boolean>(false);
   const polygonGeometryEditRef = useRef<PolygonGeometryEditState>(polygonGeometryEdit);
+  const polygonDrawRef = useRef<PolygonDrawState>(polygonDraw);
   const draggingVertexRef = useRef<PolygonVertexReference | null>(null);
   const suppressNextMapClickRef = useRef<boolean>(false);
 
@@ -1285,6 +1387,7 @@ export default function App() {
     closePolygonMenu();
     closeSmoothPanel();
     closePolygonGeometryEdit();
+    closePolygonDraw();
     setError('');
 
     const map = mapRef.current;
@@ -1460,6 +1563,20 @@ export default function App() {
     }
   }
 
+  function syncPolygonDrawSources(drawState: PolygonDrawState = polygonDrawRef.current) {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const drawSource = map.getSource(POLYGON_DRAW_PREVIEW_SOURCE_ID) as GeoJSONSource | undefined;
+    if (!drawSource) {
+      return;
+    }
+
+    drawSource.setData(buildPolygonDrawPreviewCollection(drawState));
+  }
+
   function syncGeoJsonSource(data: AnyFeatureCollection) {
     const map = mapRef.current;
     if (!map) {
@@ -1481,6 +1598,111 @@ export default function App() {
       snapCoordinate: null,
       snapSegment: null,
       snapKind: 'none',
+    });
+  }
+
+  function closePolygonDraw() {
+    setPolygonDraw({
+      open: false,
+      sourceFileId: null,
+      sourceFileName: '',
+      coordinates: [],
+      cursorCoordinate: null,
+    });
+  }
+
+  function startPolygonDraw(fileId: string, fileName: string) {
+    closePolygonGeometryEdit();
+    setEditingPolygonId(null);
+    setEditingPolygonNameDraft('');
+    closeContextMenu();
+    closePolygonMenu();
+    closeSmoothPanel();
+
+    const map = mapRef.current;
+    if (map) {
+      clearSelectedFeature(map);
+    }
+
+    setPolygonDraw({
+      open: true,
+      sourceFileId: fileId,
+      sourceFileName: fileName,
+      coordinates: [],
+      cursorCoordinate: null,
+    });
+    setError('');
+    setOperationAlert(null);
+  }
+
+  function finishPolygonDraw() {
+    const drawState = polygonDrawRef.current;
+    if (!drawState.open || !drawState.sourceFileId) {
+      return;
+    }
+
+    if (drawState.coordinates.length < 3) {
+      setError('Add at least 3 vertices to finish the polygon.');
+      return;
+    }
+
+    const fileId = drawState.sourceFileId;
+    const fileName = drawState.sourceFileName;
+    const appFeatureId = `feature-${fileId}-manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const existingFeaturesInFile = displayDataRef.current.features.filter(
+      (feature) => feature.properties?.sourceFileId === fileId,
+    ).length;
+
+    const newFeature: Feature<Geometry, GeoJsonProperties> = {
+      type: 'Feature',
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[...drawState.coordinates, [...drawState.coordinates[0]]]],
+      },
+      properties: {
+        sourceFileId: fileId,
+        sourceFileName: fileName,
+        sourceFeatureIndex: existingFeaturesInFile,
+        appFeatureId,
+      },
+    };
+
+    recordHistorySnapshot();
+    const newDisplayData: AnyFeatureCollection = {
+      type: 'FeatureCollection',
+      features: [...displayDataRef.current.features, newFeature],
+    };
+
+    setDisplayData(newDisplayData);
+    setUploadedFiles((previous) =>
+      previous.map((file) =>
+        file.id === fileId
+          ? {
+              ...file,
+              featureCount: file.featureCount + 1,
+              polygonCount: file.polygonCount + 1,
+            }
+          : file,
+      ),
+    );
+
+    closePolygonDraw();
+    syncGeoJsonSource(newDisplayData);
+    syncCsvPointSource(csvPointDataRef.current, buildPolygonBoundaryIndex(newDisplayData));
+    fitMapToCollection({
+      type: 'FeatureCollection',
+      features: [newFeature],
+    });
+
+    const map = mapRef.current;
+    if (map) {
+      setSelectedFeature(map, appFeatureId);
+    }
+
+    setError('');
+    setOperationAlert({
+      type: 'success',
+      message: `Added a new polygon to ${fileName}.`,
     });
   }
 
@@ -1512,6 +1734,8 @@ export default function App() {
   }
 
   function startPolygonEditSession(appFeatureId: string) {
+    closePolygonDraw();
+
     setCollapsedPolygonIds((previous) => {
       if (!previous.has(appFeatureId)) {
         return previous;
@@ -1618,6 +1842,10 @@ export default function App() {
   }, [polygonGeometryEdit]);
 
   useEffect(() => {
+    polygonDrawRef.current = polygonDraw;
+  }, [polygonDraw]);
+
+  useEffect(() => {
     let isCancelled = false;
 
     async function restorePersistedWorkspace() {
@@ -1676,6 +1904,15 @@ export default function App() {
 
     syncPolygonGeometryEditSources(polygonGeometryEdit);
   }, [isMapStyleReady, polygonGeometryEdit]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isMapStyleReady) {
+      return;
+    }
+
+    syncPolygonDrawSources(polygonDraw);
+  }, [isMapStyleReady, polygonDraw]);
 
   const polygonColorById = useMemo(() => buildPolygonColorById(displayData), [displayData]);
 
@@ -2087,6 +2324,13 @@ export default function App() {
       });
     }
 
+    if (!map.getSource(POLYGON_DRAW_PREVIEW_SOURCE_ID)) {
+      map.addSource(POLYGON_DRAW_PREVIEW_SOURCE_ID, {
+        type: 'geojson',
+        data: EMPTY_COLLECTION,
+      });
+    }
+
     if (!map.getLayer('geojson-fill')) {
       map.addLayer({
         id: 'geojson-fill',
@@ -2200,6 +2444,48 @@ export default function App() {
       });
     }
 
+    if (!map.getLayer(POLYGON_DRAW_FILL_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_DRAW_FILL_LAYER_ID,
+        type: 'fill',
+        source: POLYGON_DRAW_PREVIEW_SOURCE_ID,
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: {
+          'fill-color': '#2563eb',
+          'fill-opacity': 0.2,
+        },
+      });
+    }
+
+    if (!map.getLayer(POLYGON_DRAW_LINE_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_DRAW_LINE_LAYER_ID,
+        type: 'line',
+        source: POLYGON_DRAW_PREVIEW_SOURCE_ID,
+        filter: ['==', ['geometry-type'], 'LineString'],
+        paint: {
+          'line-color': '#2563eb',
+          'line-width': 2.5,
+          'line-dasharray': [2, 1],
+        },
+      });
+    }
+
+    if (!map.getLayer(POLYGON_DRAW_VERTICES_LAYER_ID)) {
+      map.addLayer({
+        id: POLYGON_DRAW_VERTICES_LAYER_ID,
+        type: 'circle',
+        source: POLYGON_DRAW_PREVIEW_SOURCE_ID,
+        filter: ['==', ['geometry-type'], 'Point'],
+        paint: {
+          'circle-radius': 4,
+          'circle-color': '#2563eb',
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffffff',
+        },
+      });
+    }
+
     if (!map.getLayer('geojson-point')) {
       map.addLayer({
         id: 'geojson-point',
@@ -2286,6 +2572,7 @@ export default function App() {
     const csvPointSource = map.getSource('csv-point-data') as GeoJSONSource | undefined;
     csvPointSource?.setData(getClassifiedCsvPointData(csvPointDataRef.current, buildPolygonBoundaryIndex(displayDataRef.current)));
     syncPolygonGeometryEditSources();
+    syncPolygonDrawSources();
     clearHoveredFeature(map);
 
     if (selectedFeatureIdRef.current) {
@@ -2381,7 +2668,19 @@ export default function App() {
     };
 
     map.on('mousedown', (event) => {
+      if (polygonDrawRef.current.open) {
+        return;
+      }
+
       if (!polygonGeometryEditRef.current.open || !polygonGeometryEditRef.current.draftFeature) {
+        return;
+      }
+
+      const mouseEvent = event.originalEvent as MouseEvent;
+      const isRightClickDeleteIntent = mouseEvent.button === 2 || (mouseEvent.button === 0 && mouseEvent.ctrlKey);
+      const isPrimaryClick = mouseEvent.button === 0 && !mouseEvent.ctrlKey;
+
+      if (!isPrimaryClick && !isRightClickDeleteIntent) {
         return;
       }
 
@@ -2401,7 +2700,24 @@ export default function App() {
       event.originalEvent.stopPropagation();
       suppressNextMapClickRef.current = true;
 
-      const mouseEvent = event.originalEvent as MouseEvent;
+      if (isRightClickDeleteIntent) {
+        setPolygonGeometryEdit((previous) => {
+          if (!previous.draftFeature) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            draftFeature: removePolygonVertex(previous.draftFeature, nextReference),
+            draggingVertexId: null,
+            snapCoordinate: null,
+            snapSegment: null,
+            snapKind: 'none',
+          };
+        });
+        return;
+      }
+
       if (mouseEvent.shiftKey) {
         setPolygonGeometryEdit((previous) => {
           if (!previous.draftFeature) {
@@ -2429,70 +2745,6 @@ export default function App() {
       }));
     });
 
-    map.on('click', POLYGON_EDIT_OUTLINE_LAYER_ID, (event) => {
-      if (!polygonGeometryEditRef.current.open || !polygonGeometryEditRef.current.draftFeature) {
-        return;
-      }
-
-      suppressNextMapClickRef.current = true;
-
-      const nearestSegment = findNearestSegmentForCoordinate(
-        map,
-        polygonGeometryEditRef.current.draftFeature,
-        [event.lngLat.lng, event.lngLat.lat],
-        POLYGON_EDIT_SNAP_THRESHOLD_PX + 4,
-      );
-      if (!nearestSegment) {
-        return;
-      }
-
-      setPolygonGeometryEdit((previous) => {
-        if (!previous.draftFeature) {
-          return previous;
-        }
-
-        return {
-          ...previous,
-          draftFeature: insertPolygonVertexOnSegment(
-            previous.draftFeature,
-            nearestSegment.reference,
-            nearestSegment.snappedCoordinate,
-          ),
-          snapCoordinate: nearestSegment.snappedCoordinate,
-          snapSegment: null,
-          snapKind: 'vertex',
-        };
-      });
-    });
-
-    map.on('mouseenter', POLYGON_EDIT_OUTLINE_LAYER_ID, () => {
-      if (!draggingVertexRef.current && polygonGeometryEditRef.current.open) {
-        map.getCanvas().style.cursor = 'copy';
-      }
-    });
-
-    map.on('mouseleave', POLYGON_EDIT_OUTLINE_LAYER_ID, () => {
-      if (!draggingVertexRef.current) {
-        map.getCanvas().style.cursor = '';
-      }
-    });
-
-    map.on('mouseenter', POLYGON_EDIT_VERTICES_LAYER_ID, () => {
-      map.getCanvas().style.cursor = draggingVertexRef.current ? 'grabbing' : 'grab';
-    });
-
-    map.on('mouseleave', POLYGON_EDIT_VERTICES_LAYER_ID, () => {
-      if (!draggingVertexRef.current) {
-        map.getCanvas().style.cursor = '';
-      }
-    });
-
-    map.on('mouseup', () => {
-      if (draggingVertexRef.current) {
-        finishVertexDrag();
-      }
-    });
-
     map.on('click', (event) => {
       if (draggingVertexRef.current) {
         return;
@@ -2500,6 +2752,71 @@ export default function App() {
 
       if (suppressNextMapClickRef.current) {
         suppressNextMapClickRef.current = false;
+        return;
+      }
+
+      if (polygonDrawRef.current.open) {
+        event.preventDefault();
+        event.originalEvent.stopPropagation();
+
+        const nextCoordinate: [number, number] = [event.lngLat.lng, event.lngLat.lat];
+        setPolygonDraw((previous) => {
+          if (!previous.open) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            coordinates: [...previous.coordinates, nextCoordinate],
+            cursorCoordinate: nextCoordinate,
+          };
+        });
+        setError('');
+        return;
+      }
+
+      if (polygonGeometryEditRef.current.open && polygonGeometryEditRef.current.draftFeature) {
+        const nearestVertex = findNearestVertexForCoordinate(
+          map,
+          polygonGeometryEditRef.current.draftFeature,
+          [event.lngLat.lng, event.lngLat.lat],
+          14,
+        );
+        if (nearestVertex) {
+          return;
+        }
+
+        const nearestSegment = findNearestSegmentForCoordinate(
+          map,
+          polygonGeometryEditRef.current.draftFeature,
+          [event.lngLat.lng, event.lngLat.lat],
+          POLYGON_EDIT_SNAP_THRESHOLD_PX + 10,
+        );
+        if (!nearestSegment) {
+          return;
+        }
+
+        event.preventDefault();
+        event.originalEvent.stopPropagation();
+
+        setPolygonGeometryEdit((previous) => {
+          if (!previous.draftFeature) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            draftFeature: insertPolygonVertexOnSegment(
+              previous.draftFeature,
+              nearestSegment.reference,
+              nearestSegment.snappedCoordinate,
+            ),
+            snapCoordinate: nearestSegment.snappedCoordinate,
+            snapSegment: null,
+            snapKind: 'vertex',
+          };
+        });
+
         return;
       }
 
@@ -2540,7 +2857,59 @@ export default function App() {
       closePolygonMenu();
     });
 
+    map.on('mouseenter', POLYGON_EDIT_OUTLINE_LAYER_ID, () => {
+      if (!draggingVertexRef.current && polygonGeometryEditRef.current.open) {
+        map.getCanvas().style.cursor = 'copy';
+      }
+    });
+
+    map.on('mouseleave', POLYGON_EDIT_OUTLINE_LAYER_ID, () => {
+      if (!draggingVertexRef.current) {
+        map.getCanvas().style.cursor = '';
+      }
+    });
+
+    map.on('mouseenter', POLYGON_EDIT_VERTICES_LAYER_ID, () => {
+      map.getCanvas().style.cursor = draggingVertexRef.current ? 'grabbing' : 'grab';
+    });
+
+    map.on('mouseleave', POLYGON_EDIT_VERTICES_LAYER_ID, () => {
+      if (!draggingVertexRef.current) {
+        map.getCanvas().style.cursor = '';
+      }
+    });
+
+    map.on('mouseup', () => {
+      if (draggingVertexRef.current) {
+        finishVertexDrag();
+      }
+    });
+
     map.on('mousemove', (event) => {
+      if (polygonDrawRef.current.open) {
+        const nextCoordinate: [number, number] = [event.lngLat.lng, event.lngLat.lat];
+        setPolygonDraw((previous) => {
+          if (!previous.open) {
+            return previous;
+          }
+
+          if (
+            previous.cursorCoordinate &&
+            previous.cursorCoordinate[0] === nextCoordinate[0] &&
+            previous.cursorCoordinate[1] === nextCoordinate[1]
+          ) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            cursorCoordinate: nextCoordinate,
+          };
+        });
+        map.getCanvas().style.cursor = 'crosshair';
+        return;
+      }
+
       if (draggingVertexRef.current && polygonGeometryEditRef.current.draftFeature) {
         const activeDragReference = draggingVertexRef.current;
         const isSnapSuppressed = (event.originalEvent as MouseEvent).altKey;
@@ -2579,6 +2948,99 @@ export default function App() {
         return;
       }
 
+      if (polygonGeometryEditRef.current.open && polygonGeometryEditRef.current.draftFeature) {
+        const nearestVertex = findNearestVertexForCoordinate(
+          map,
+          polygonGeometryEditRef.current.draftFeature,
+          [event.lngLat.lng, event.lngLat.lat],
+          14,
+        );
+
+        if (nearestVertex) {
+          setPolygonGeometryEdit((previous) => {
+            if (
+              previous.snapCoordinate === null &&
+              previous.snapSegment === null &&
+              previous.snapKind === 'none'
+            ) {
+              return previous;
+            }
+
+            return {
+              ...previous,
+              snapCoordinate: null,
+              snapSegment: null,
+              snapKind: 'none',
+            };
+          });
+          map.getCanvas().style.cursor = 'grab';
+          return;
+        }
+
+        const nearestSegment = findNearestSegmentForCoordinate(
+          map,
+          polygonGeometryEditRef.current.draftFeature,
+          [event.lngLat.lng, event.lngLat.lat],
+          POLYGON_EDIT_SNAP_THRESHOLD_PX + 10,
+        );
+
+        if (!nearestSegment) {
+          setPolygonGeometryEdit((previous) => {
+            if (
+              previous.snapCoordinate === null &&
+              previous.snapSegment === null &&
+              previous.snapKind === 'none'
+            ) {
+              return previous;
+            }
+
+            return {
+              ...previous,
+              snapCoordinate: null,
+              snapSegment: null,
+              snapKind: 'none',
+            };
+          });
+          map.getCanvas().style.cursor = '';
+          return;
+        }
+
+        setPolygonGeometryEdit((previous) => {
+          if (!previous.draftFeature) {
+            return previous;
+          }
+
+          const previewSegment = getSegmentCoordinates(previous.draftFeature, nearestSegment.reference);
+
+          const hadSameCoordinate =
+            previous.snapCoordinate !== null &&
+            previous.snapCoordinate[0] === nearestSegment.snappedCoordinate[0] &&
+            previous.snapCoordinate[1] === nearestSegment.snappedCoordinate[1];
+
+          const hadSameSegment =
+            previewSegment !== null &&
+            previous.snapSegment !== null &&
+            previous.snapSegment[0][0] === previewSegment[0][0] &&
+            previous.snapSegment[0][1] === previewSegment[0][1] &&
+            previous.snapSegment[1][0] === previewSegment[1][0] &&
+            previous.snapSegment[1][1] === previewSegment[1][1];
+
+          if (hadSameCoordinate && hadSameSegment && previous.snapKind === 'edge') {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            snapCoordinate: nearestSegment.snappedCoordinate,
+            snapSegment: previewSegment,
+            snapKind: 'edge',
+          };
+        });
+
+        map.getCanvas().style.cursor = 'copy';
+        return;
+      }
+
       if (!map.getLayer('geojson-fill')) {
         map.getCanvas().style.cursor = '';
         return;
@@ -2594,6 +3056,18 @@ export default function App() {
 
     map.on('mouseleave', () => {
       clearHoveredFeature(map);
+      if (polygonDrawRef.current.open) {
+        setPolygonDraw((previous) => {
+          if (!previous.open || previous.cursorCoordinate === null) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            cursorCoordinate: null,
+          };
+        });
+      }
       map.getCanvas().style.cursor = '';
     });
 
@@ -2992,7 +3466,15 @@ export default function App() {
       closePolygonGeometryEdit();
     }
 
+    if (polygonDrawRef.current.open && polygonDrawRef.current.sourceFileId === fileId) {
+      closePolygonDraw();
+    }
+
     closeContextMenu();
+  }
+
+  function handleAddPolygonToFile(fileId: string, fileName: string) {
+    startPolygonDraw(fileId, fileName);
   }
 
   function handleClearAll() {
@@ -3016,6 +3498,7 @@ export default function App() {
 
     closeContextMenu();
     closePolygonGeometryEdit();
+    closePolygonDraw();
 
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -3586,6 +4069,34 @@ export default function App() {
               {operationAlert.message}
             </p>
           ) : null}
+
+          {polygonDraw.open ? (
+            <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-blue-700">Drawing New Polygon</p>
+              <p className="mt-1 text-xs text-blue-700">
+                {polygonDraw.sourceFileName}: click map to add vertices ({polygonDraw.coordinates.length} added).
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={finishPolygonDraw}
+                  disabled={polygonDraw.coordinates.length < 3}
+                  className="inline-flex items-center gap-1 rounded-md bg-blue-700 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-blue-300"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  Finish
+                </button>
+                <button
+                  type="button"
+                  onClick={closePolygonDraw}
+                  className="inline-flex items-center gap-1 rounded-md border border-blue-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-blue-700 transition hover:bg-blue-100"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <section className="mt-4 flex min-h-0 flex-1 flex-col rounded-2xl border border-slate-200 bg-white/85 p-4 shadow-sm">
@@ -3770,12 +4281,22 @@ export default function App() {
                         {group.featureCount} features, {group.polygons.length} polygons currently visible
                       </p>
                     </div>
-                    <button
-                      onClick={() => handleRemoveFile(group.id)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 p-2 text-xs font-semibold text-red-700 transition hover:bg-red-200"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleAddPolygonToFile(group.id, group.name)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100"
+                        title={`Draw polygon in ${group.name}`}
+                        aria-label={`Draw polygon in ${group.name}`}
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={() => handleRemoveFile(group.id)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 p-2 text-xs font-semibold text-red-700 transition hover:bg-red-200"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
 
                   <div className="space-y-2">
@@ -3923,7 +4444,7 @@ export default function App() {
                               >
                               {isGeometryEditActive ? (
                                 <p className="mt-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-700">
-                                  Drag vertices to move, click edges to insert vertices, and Shift-click a vertex to delete. Snapping guides are enabled.
+                                  Drag vertices to move, hover and click near edges to insert vertices, and right-click (or Shift-click) a vertex to delete. Snapping guides are enabled.
                                 </p>
                               ) : null}
                               <div className="mt-1 flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
